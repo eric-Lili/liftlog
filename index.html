@@ -907,7 +907,11 @@
 
         <button class="btn ghost" data-go="pick">+ Add an exercise</button>
         ${session
-          ? `<button class="btn" data-act="complete-session">Complete workout</button>`
+          ? `<button class="btn" data-act="complete-session">Complete workout</button>
+             <div class="row">
+               <button class="btn ghost small" data-go="routines">Switch workout</button>
+               <button class="btn ghost small" data-act="discard-session">Discard</button>
+             </div>`
           : `<button class="btn" data-go="routines">${state.routines.length ? 'Start a workout' : 'Set up a routine'}</button>`}
       `,
     };
@@ -1114,8 +1118,10 @@
     return {
       title: 'Routines', back: 'today',
       html: `
-        ${session ? `<div class="card muted">A workout is already in progress. Starting another will leave that one
-          open — finish it from the Today tab first if you meant to.</div>` : ''}
+        ${session ? `<div class="card muted">
+          <strong>${esc(session.name)}</strong> is in progress. Picking another switches this session to it —
+          your clock and anything already logged carry over.
+        </div>` : ''}
 
         ${state.routines.length ? state.routines.map(r => `
           <div class="card">
@@ -1135,7 +1141,11 @@
                     <div class="name">${esc(w.name)}</div>
                     <div class="meta">${w.exercises.length ? esc(w.exercises.join(', ')) : 'No exercises yet'}</div>
                   </button>
-                  <button class="btn small" data-act="start-workout" data-id="${w.id}">Start</button>
+                  <button class="btn small${session && session.workoutId === w.id ? ' ghost' : ''}"
+                          data-act="${session ? 'switch-workout' : 'start-workout'}" data-id="${w.id}"
+                          ${session && session.workoutId === w.id ? 'disabled' : ''}>
+                    ${session ? (session.workoutId === w.id ? 'Current' : 'Switch') : 'Start'}
+                  </button>
                 </div>`).join('') || '<div class="muted">No workouts yet.</div>'}
             </div>
             <div style="margin-top:0.6rem">
@@ -1191,7 +1201,9 @@
           </div>
         </div>
 
-        <button class="btn" data-act="start-workout" data-id="${w.id}">Start this workout</button>
+        ${activeSession()
+          ? `<button class="btn" data-act="switch-workout" data-id="${w.id}">Switch to this workout</button>`
+          : `<button class="btn" data-act="start-workout" data-id="${w.id}">Start this workout</button>`}
       `,
     };
   }
@@ -1467,60 +1479,86 @@
     $app.querySelectorAll('[data-act]').forEach(el => el.addEventListener('click', () => act(el.dataset.act, el.dataset)));
   }
 
-  // Hold-and-drag reordering. Deliberately pointer events rather than HTML5
-  // drag-and-drop, which does not fire reliably on touch. Press and hold the
-  // handle for a moment, then drag; the row follows your finger and the list
-  // reflows live. The resulting order is saved to the workout.
+  // Hold-and-drag reordering. Pointer events rather than HTML5 drag-and-drop,
+  // which does not fire reliably on touch.
+  //
+  // The row geometry is measured ONCE when the drag begins and never re-read.
+  // An earlier version reordered the DOM as you dragged and hit-tested against
+  // live positions, so each swap moved the ground under the next measurement
+  // and a single gesture could advance two places. Here the DOM order is left
+  // alone for the whole drag: the held row follows the finger, its neighbours
+  // are shifted purely visually, and the list is rewritten once on drop.
   const HOLD_MS = 180;
   function wireDrag() {
     const list = document.getElementById('today-list') || document.getElementById('workout-list');
     if (!list) return;
 
-    let held = null, holdTimer = null, startY = 0, offsetY = 0;
-
-    function rowsOf() { return [...list.querySelectorAll('.drag-item')]; }
+    let held = null, holdTimer = null;
+    let rows = [], mids = [], fromIndex = -1, toIndex = -1, grabY = 0, step = 0;
 
     function begin(row, y) {
-      held = row;
-      startY = y;
-      offsetY = y - row.getBoundingClientRect().top;
+      rows = [...list.querySelectorAll('.drag-item')];
+      fromIndex = rows.indexOf(row);
+      if (fromIndex < 0) return;
+
+      const boxes = rows.map(r => r.getBoundingClientRect());
+      mids = boxes.map(b => b.top + b.height / 2);
+      // Rows sit in a flex column with a gap, so one place is the row height
+      // plus that gap — measured, not assumed.
+      step = boxes.length > 1 ? Math.abs(mids[1] - mids[0]) : boxes[0].height;
+
+      held = row; grabY = y; toIndex = fromIndex;
       row.classList.add('dragging');
       list.classList.add('dragging-active');
       if (navigator.vibrate) navigator.vibrate(15);
     }
 
-    function moveTo(y) {
-      if (!held) return;
-      const top = y - offsetY;
-      held.style.transform = `translateY(${y - startY}px)`;
-      // Swap with whichever sibling's midpoint we've crossed.
-      for (const other of rowsOf()) {
-        if (other === held) continue;
-        const box = other.getBoundingClientRect();
-        const mid = box.top + box.height / 2;
-        if (top < mid && held.compareDocumentPosition(other) & Node.DOCUMENT_POSITION_PRECEDING) {
-          list.insertBefore(held, other); resetOrigin(y); return;
-        }
-        if (top + held.offsetHeight > mid && held.compareDocumentPosition(other) & Node.DOCUMENT_POSITION_FOLLOWING) {
-          list.insertBefore(held, other.nextSibling); resetOrigin(y); return;
-        }
+    // Where the held row now belongs: how many other rows its centre has passed.
+    // One position costs one row of travel — swapping at half a row is what
+    // makes a list feel like it jumps ahead of your finger. The comparison is
+    // inclusive downwards and exclusive upwards so that landing exactly on a
+    // neighbour's centre resolves the same way in both directions.
+    function indexFor(centre) {
+      let idx = 0;
+      for (let i = 0; i < mids.length; i++) {
+        if (i === fromIndex) continue;
+        if (i < fromIndex ? centre > mids[i] : centre >= mids[i]) idx++;
+      }
+      return idx;
+    }
+
+    function paint(delta) {
+      held.style.transform = `translateY(${delta}px)`;
+      for (let i = 0; i < rows.length; i++) {
+        if (i === fromIndex) continue;
+        let shift = 0;
+        if (toIndex > fromIndex && i > fromIndex && i <= toIndex) shift = -step;
+        else if (toIndex < fromIndex && i >= toIndex && i < fromIndex) shift = step;
+        rows[i].style.transform = shift ? `translateY(${shift}px)` : '';
       }
     }
-    function resetOrigin(y) {
-      startY = y;
-      offsetY = y - held.getBoundingClientRect().top;
-      held.style.transform = '';
+
+    function moveTo(y) {
+      const delta = y - grabY;
+      toIndex = indexFor(mids[fromIndex] + delta);
+      paint(delta);
     }
 
     function finish() {
       clearTimeout(holdTimer);
       if (!held) return;
-      held.style.transform = '';
+      const order = rows.map(r => r.dataset.exercise);
+      const [moved] = order.splice(fromIndex, 1);
+      order.splice(toIndex, 0, moved);
+      const changed = toIndex !== fromIndex;
+
+      for (const r of rows) r.style.transform = '';
       held.classList.remove('dragging');
       list.classList.remove('dragging-active');
       held = null;
-      const order = rowsOf().map(r => r.dataset.exercise);
-      commitOrder(order);
+
+      if (changed) commitOrder(order);
+      else render();          // drop the inline transforms
     }
 
     list.addEventListener('pointerdown', e => {
@@ -1539,6 +1577,18 @@
     });
     list.addEventListener('pointerup', finish);
     list.addEventListener('pointercancel', finish);
+  }
+
+  // Exposed for tests: given the row midpoints, where a drag from `fromIndex`
+  // displaced by `delta` pixels should land.
+  function dropIndex(mids, fromIndex, delta) {
+    const centre = mids[fromIndex] + delta;
+    let idx = 0;
+    for (let i = 0; i < mids.length; i++) {
+      if (i === fromIndex) continue;
+      if (i < fromIndex ? centre > mids[i] : centre >= mids[i]) idx++;
+    }
+    return idx;
   }
 
   // Persist a reordered exercise list back to the workout it belongs to.
@@ -1642,12 +1692,48 @@
         const session = activeSession();
         if (!session) return;
         const logged = state.sets.filter(s => s.sessionId === session.id).length;
-        if (!logged && !confirm('No sets were logged. Close this workout anyway?')) return;
+        // Nothing logged means nothing happened — recording a zero-length
+        // workout would just be litter in the history.
+        if (!logged) {
+          state.sessions = state.sessions.filter(x => x.id !== session.id);
+          state.active = null;
+          save(); go('today'); toast('Nothing logged — workout discarded.');
+          return;
+        }
         session.endedAt = new Date().toISOString();
         if (!session.startedAt) session.startedAt = session.endedAt;
         state.active = null;
         save(); go('today');
-        toast(logged ? `Workout complete — ${logged} set${logged === 1 ? '' : 's'}.` : 'Workout closed.');
+        toast(`Workout complete — ${logged} set${logged === 1 ? '' : 's'}.`);
+        return;
+      }
+      case 'discard-session': {
+        const session = activeSession();
+        if (!session) return;
+        const logged = state.sets.filter(s => s.sessionId === session.id);
+        if (logged.length && !confirm(
+          `Discard this workout? The ${logged.length} set${logged.length === 1 ? '' : 's'} you logged stay in your history — only the workout record goes.`
+        )) return;
+        // Keep the sets; they were really lifted. Just detach them.
+        for (const s of state.sets) if (s.sessionId === session.id) delete s.sessionId;
+        state.sessions = state.sessions.filter(x => x.id !== session.id);
+        state.active = null;
+        save(); go('today'); toast('Workout discarded.');
+        return;
+      }
+      case 'switch-workout': {
+        const session = activeSession();
+        const w = workoutById(data.id);
+        if (!session || !w) return;
+        const r = routineOfWorkout(w.id);
+        // The session carries on — its clock and its sets are untouched, it is
+        // just a different workout than you first thought.
+        session.workoutId = w.id;
+        session.name = w.name;
+        session.routineId = r ? r.id : null;
+        session.routineName = r ? r.name : '';
+        if (state.active) state.active.skipped = [];
+        save(); go('today'); toast(`Now doing ${w.name}.`);
         return;
       }
       case 'skip-exercise': {

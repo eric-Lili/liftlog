@@ -21,6 +21,12 @@ Reordering exercises during a session is saved back to the **workout**, so the
 order sticks next time. Skipping one — a broken machine, a day you don't feel
 like it — applies to **that session only** and leaves the workout alone.
 
+A session can be **completed**, **switched** to a different workout (the clock
+and anything logged carry over — for when you started the wrong one), or
+**discarded**. Discarding removes the workout record but keeps the sets: you
+did lift them. Completing a workout with nothing logged discards it rather than
+recording an empty one.
+
 ## Why
 
 FitNotes is a good logger but has no progression logic — you decide the
