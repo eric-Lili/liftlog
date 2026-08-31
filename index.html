@@ -190,6 +190,16 @@
   }
   .plates.warn { color: var(--danger); font-weight: 600; }
 
+  .brief { margin-top: 0.4rem; line-height: 1.55; font-size: 0.92rem; }
+  .brief p { margin: 0 0 0.7rem; }
+  .brief p:last-child { margin-bottom: 0; }
+  .btn[disabled] { opacity: 0.6; pointer-events: none; }
+  input[type="password"] {
+    width: 100%; border: 1px solid var(--rule); border-radius: 10px; background: var(--paper);
+    padding: 0.6rem 0.7rem; font-size: 0.92rem; color: var(--ink);
+  }
+  code { font-size: 0.85em; background: var(--paper); padding: 0.05rem 0.25rem; border-radius: 4px; }
+
   @media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
 </style>
 </head>
@@ -209,16 +219,27 @@
   //       (performed as a) Session, which owns the sets logged against it
   const BLANK = {
     schemaVersion: SCHEMA,
+    epoch: 1,           // bumped on any wholesale replace; a higher epoch wins a sync
     sets: [],           // { id, date, exercise, weight, reps, notes, src, sessionId }
     exercises: {},      // name -> { category, kind, equipment }
     routines: [],       // { id, name, weeks, workouts: [{ id, name, exercises: [name] }] }
     sessions: [],       // { id, date, routineId, workoutId, name, startedAt, endedAt }
     active: null,       // { sessionId, skipped: [name] } while a workout is underway
     settings: {},
-    coachSuggestions: {},
     goals: [],
+    profile: { goals: '', equipment: '', schedule: '', injuries: '' },
     prefs: { increment: 1.25, bar: 20, plates: [20, 15, 10, 5, 2.5, 1.25] },
+    // Written by the coach, never by the app — see the ownership note in sync().
+    coachSuggestions: {},   // name -> { weight, reps, note }
+    coachBrief: null,       // { text, at }
+    coachProposals: [],     // { id, kind, title, detail, payload }
   };
+
+  // Sync credentials live under their own key, deliberately outside `state`:
+  // otherwise the token would ride along in every backup file and in the
+  // synced payload itself.
+  const SYNC_KEY = 'liftlog.sync';
+  const SYNC_BLANK = { repo: '', token: '', sha: null, lastAt: null, deviceId: '' };
 
   // v1 stored a flat `routines` list whose entries were really *workouts*, named
   // "Routine · Workout" by the FitNotes converter. Split them back apart rather
@@ -267,8 +288,23 @@
     }
   }
 
+  function loadSync() {
+    try {
+      const raw = localStorage.getItem(SYNC_KEY);
+      const cfg = Object.assign(structuredClone(SYNC_BLANK), raw ? JSON.parse(raw) : {});
+      if (!cfg.deviceId) { cfg.deviceId = uid() + uid(); saveSync(cfg); }
+      return cfg;
+    } catch { return structuredClone(SYNC_BLANK); }
+  }
+  function saveSync(cfg) {
+    try { localStorage.setItem(SYNC_KEY, JSON.stringify(cfg)); } catch (err) { console.error(err); }
+  }
+
   let state = load();
+  let sync = loadSync();
   let view = { name: 'today' };
+  let syncing = false;
+  let syncNote = '';
 
   // ---------------------------------------------------------------- helpers
   const $app = document.getElementById('app');
@@ -687,6 +723,125 @@
     return next;
   }
 
+  // ----------------------------------------------------------------- sync
+  // One file in a private repo is the shared source of truth. Ownership is
+  // structural rather than by convention: the app owns everything under `app`
+  // and never writes `coach`; the coach owns `coach` and never writes `app`.
+  // A push therefore carries the remote's own coach block back untouched, so
+  // the two can never clobber each other.
+  const SYNC_FILE = 'state.json';
+  const APP_FIELDS = ['schemaVersion', 'epoch', 'sets', 'exercises', 'routines', 'sessions', 'settings', 'goals', 'profile', 'prefs'];
+
+  function appPayload() {
+    const out = {};
+    for (const k of APP_FIELDS) out[k] = state[k];
+    return out;
+  }
+  function coachPayload() {
+    return { suggestions: state.coachSuggestions, brief: state.coachBrief, proposals: state.coachProposals };
+  }
+  function applyCoach(coach) {
+    if (!coach || typeof coach !== 'object') return false;
+    state.coachSuggestions = coach.suggestions && typeof coach.suggestions === 'object' ? coach.suggestions : {};
+    state.coachBrief = coach.brief || null;
+    state.coachProposals = Array.isArray(coach.proposals) ? coach.proposals : [];
+    return true;
+  }
+  function adoptApp(app) {
+    for (const k of APP_FIELDS) if (app[k] !== undefined) state[k] = app[k];
+    state.active = null;   // another device's in-progress session isn't ours
+  }
+
+  function ghHeaders() {
+    return { Authorization: `Bearer ${sync.token}`, Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28' };
+  }
+  function ghUrl() {
+    return `https://api.github.com/repos/${sync.repo}/contents/${SYNC_FILE}`;
+  }
+
+  // Returns { doc, sha } — doc is null when the file does not exist yet.
+  async function fetchRemote() {
+    const res = await fetch(ghUrl(), { headers: ghHeaders(), cache: 'no-store' });
+    if (res.status === 404) return { doc: null, sha: null };
+    if (res.status === 401 || res.status === 403) throw new Error('the token was rejected — check it has Contents access to this repo');
+    if (!res.ok) throw new Error(`GitHub returned ${res.status}`);
+    const meta = await res.json();
+    // The contents API base64-encodes with embedded newlines.
+    const json = decodeURIComponent(escape(atob(String(meta.content || '').replace(/\n/g, ''))));
+    return { doc: JSON.parse(json), sha: meta.sha };
+  }
+
+  async function putRemote(doc, sha) {
+    const body = {
+      message: `liftlog: ${state.sets.length} sets from ${sync.deviceId.slice(0, 6)}`,
+      content: btoa(unescape(encodeURIComponent(JSON.stringify(doc, null, 1)))),
+      ...(sha ? { sha } : {}),
+    };
+    const res = await fetch(ghUrl(), { method: 'PUT', headers: ghHeaders(), body: JSON.stringify(body) });
+    if (res.status === 409 || res.status === 422) return { conflict: true };
+    if (!res.ok) throw new Error(`GitHub returned ${res.status}`);
+    const meta = await res.json();
+    return { sha: meta.content && meta.content.sha };
+  }
+
+  function syncConfigured() { return !!(sync.repo && sync.token); }
+
+  async function runSync({ quiet = false } = {}) {
+    if (!syncConfigured() || syncing) return;
+    syncing = true; syncNote = 'Syncing…'; render();
+    try {
+      let { doc, sha } = await fetchRemote();
+
+      // Take the remote copy when it is genuinely newer, or when this device is
+      // empty and not ahead — a browser can evict storage, and a returning
+      // empty client must not overwrite real history. The "not ahead" part
+      // matters: a deliberate erase bumps the epoch, and that has to propagate
+      // rather than be quietly refilled from the server.
+      const remoteApp = doc && doc.app;
+      const localEmpty = state.sets.length === 0;
+      const remoteEpoch = remoteApp ? (remoteApp.epoch || 0) : 0;
+      const remoteAhead = remoteEpoch > (state.epoch || 0);
+      if (remoteApp && (remoteAhead || (localEmpty && remoteEpoch >= (state.epoch || 0)))) {
+        adoptApp(remoteApp);
+        applyCoach(doc.coach);
+        save();
+        syncNote = localEmpty ? 'Loaded from the server.' : 'Newer data from another device — adopted.';
+        if (!quiet) toast(syncNote);
+        sync.sha = sha; sync.lastAt = new Date().toISOString(); saveSync(sync);
+        return;
+      }
+
+      if (doc) applyCoach(doc.coach);
+
+      const next = {
+        format: 'liftlog-state', version: 1,
+        updatedAt: new Date().toISOString(), updatedBy: sync.deviceId,
+        app: appPayload(),
+        coach: doc && doc.coach ? doc.coach : coachPayload(),
+      };
+      let put = await putRemote(next, sha);
+      if (put.conflict) {
+        // Someone wrote between our read and our write. Re-read and retry once.
+        const again = await fetchRemote();
+        if (again.doc) applyCoach(again.doc.coach);
+        next.coach = again.doc && again.doc.coach ? again.doc.coach : next.coach;
+        put = await putRemote(next, again.sha);
+        if (put.conflict) throw new Error('the file kept changing underneath — try again');
+      }
+      sync.sha = put.sha; sync.lastAt = new Date().toISOString(); saveSync(sync);
+      save();
+      syncNote = `Synced ${new Date().toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })}`;
+      if (!quiet) toast('Synced.');
+    } catch (err) {
+      console.error('sync failed', err);
+      syncNote = `Sync failed — ${err.message}`;
+      if (!quiet) toast(syncNote);
+    } finally {
+      syncing = false;
+      render();
+    }
+  }
+
   function download(filename, text, type = 'text/csv') {
     const url = URL.createObjectURL(new Blob([text], { type }));
     const a = document.createElement('a');
@@ -1041,10 +1196,132 @@
     };
   }
 
+  // What the coach has said, and anything it wants to change. Structural
+  // changes arrive as proposals rather than edits — an agent quietly rewriting
+  // a 16-week programme is not something to discover mid-session.
+  function coachView() {
+    const brief = state.coachBrief;
+    const props = state.coachProposals || [];
+    const sugg = Object.entries(state.coachSuggestions || {});
+
+    return {
+      title: 'Coach',
+      sub: brief && brief.at ? `Last looked ${fmtDate(brief.at.slice(0, 10))}` : (syncConfigured() ? 'Nothing yet' : 'Not connected'),
+      html: `
+        ${!syncConfigured() ? `<div class="card">
+          <div class="eyebrow">Not connected</div>
+          <p class="muted" style="margin:0.45rem 0 0.75rem;line-height:1.5">
+            The coach reads your training from a private repo. Set that up under
+            <strong>Data → Sync</strong>, then ask it to take a look.
+          </p>
+          <button class="btn ghost" data-go="data">Open sync settings</button>
+        </div>` : ''}
+
+        ${brief ? `<div class="card">
+          <div class="eyebrow">Assessment</div>
+          <div class="brief">${brief.text.split(/\n{2,}/).map(p => `<p>${esc(p)}</p>`).join('')}</div>
+        </div>` : (syncConfigured() ? `<div class="card muted">
+          No assessment yet. Sync, then ask the coach to review your training.
+        </div>` : '')}
+
+        ${props.length ? `<div class="card">
+          <div class="eyebrow">Proposals</div>
+          <p class="muted" style="margin:0.4rem 0 0.7rem">Nothing changes until you accept it.</p>
+          <div class="list-stack">
+            ${props.map(p => `
+              <div class="card" style="padding:0.75rem 0.85rem">
+                <div style="font-weight:650">${esc(p.title || p.kind || 'Proposal')}</div>
+                ${p.detail ? `<div class="muted" style="margin-top:0.25rem;line-height:1.45">${esc(p.detail)}</div>` : ''}
+                <div class="row" style="margin-top:0.6rem">
+                  <button class="btn small" data-act="accept-proposal" data-id="${esc(p.id)}">Accept</button>
+                  <button class="btn small ghost" data-act="dismiss-proposal" data-id="${esc(p.id)}">Dismiss</button>
+                </div>
+              </div>`).join('')}
+          </div>
+        </div>` : ''}
+
+        ${sugg.length ? `<div class="card">
+          <div class="eyebrow">Per-exercise calls</div>
+          <p class="muted" style="margin:0.4rem 0 0.6rem">These replace the automatic suggestion on each exercise.</p>
+          ${sugg.map(([name, s]) => `
+            <div class="set-row">
+              <div class="v"><div class="name">${esc(name)}</div>
+                ${s.note ? `<div class="meta muted">${esc(s.note)}</div>` : ''}</div>
+              <div class="mono" style="font-weight:650">${num(s.weight)}×${s.reps}</div>
+            </div>`).join('')}
+          <div style="margin-top:0.7rem"><button class="btn small ghost" data-act="clear-coach">Clear these</button></div>
+        </div>` : ''}
+      `,
+    };
+  }
+
+  function profileView() {
+    const p = state.profile || {};
+    return {
+      title: 'About you', back: 'data',
+      html: `
+        <div class="card">
+          <p class="muted" style="margin:0 0 0.75rem;line-height:1.5">
+            The coach reads this to shape its advice. The injuries line especially — it is what stops it
+            programming around something it doesn't know about.
+          </p>
+          <label class="field-label" for="p-goals">Goals</label>
+          <input type="text" id="p-goals" value="${esc(p.goals || '')}" placeholder="e.g. build muscle">
+          <div style="margin-top:0.6rem">
+            <label class="field-label" for="p-equipment">Equipment / setting</label>
+            <input type="text" id="p-equipment" value="${esc(p.equipment || '')}" placeholder="e.g. full gym">
+          </div>
+          <div style="margin-top:0.6rem">
+            <label class="field-label" for="p-schedule">Days per week</label>
+            <input type="text" id="p-schedule" inputmode="numeric" value="${esc(p.schedule || '')}" placeholder="4">
+          </div>
+          <div style="margin-top:0.6rem">
+            <label class="field-label" for="p-injuries">Injuries / constraints</label>
+            <input type="text" id="p-injuries" value="${esc(p.injuries || '')}" placeholder="e.g. sore lower back">
+          </div>
+          <div style="margin-top:0.8rem"><button class="btn" data-act="save-profile">Save</button></div>
+        </div>
+      `,
+    };
+  }
+
   function dataView() {
     return {
       title: 'Data',
       html: `
+        <div class="card">
+          <div class="eyebrow">Sync${syncConfigured() ? '' : ' — not set up'}</div>
+          <p class="muted" style="margin:0.45rem 0 0.75rem;line-height:1.5">
+            Keeps your training in a private GitHub repo so the coach can read it and write back.
+            The token is stored on this device only and never goes into a backup file or the synced data.
+          </p>
+          <label class="field-label" for="sync-repo">Repo (owner/name)</label>
+          <input type="text" id="sync-repo" value="${esc(sync.repo)}" placeholder="eric-Lili/liftlog-data" autocapitalize="off" spellcheck="false">
+          <div style="margin-top:0.6rem">
+            <label class="field-label" for="sync-token">Fine-grained token</label>
+            <input type="password" id="sync-token" value="${sync.token ? '••••••••••••' : ''}" placeholder="github_pat_…" autocomplete="off">
+          </div>
+          <p class="muted" style="margin:0.6rem 0 0.7rem;line-height:1.45">
+            Scope it to <strong>that repo only</strong>, Contents: read &amp; write. Do not give it access to the
+            <code>liftlog</code> repo — every GitHub Pages site on your account shares one origin, so a token that
+            could rewrite the app itself would be a genuine problem.
+          </p>
+          <div class="row">
+            <button class="btn ghost" data-act="save-sync">Save</button>
+            <button class="btn${syncConfigured() ? '' : ' ghost'}" data-act="sync-now"${syncing ? ' disabled' : ''}>${syncing ? 'Syncing…' : 'Sync now'}</button>
+          </div>
+          ${syncNote ? `<div class="muted" style="margin-top:0.6rem">${esc(syncNote)}</div>`
+            : (sync.lastAt ? `<div class="muted" style="margin-top:0.6rem">Last synced ${new Date(sync.lastAt).toLocaleString()}</div>` : '')}
+        </div>
+
+        <div class="card">
+          <div class="eyebrow">About you</div>
+          <p class="muted" style="margin:0.45rem 0 0.7rem;line-height:1.5">
+            Goals, equipment and injuries — what the coach reasons from.
+          </p>
+          <button class="btn ghost" data-go="profile">Edit</button>
+        </div>
+
         <div class="card">
           <div class="eyebrow">Import from FitNotes</div>
           <p class="muted" style="margin:0.45rem 0 0.75rem;line-height:1.5">
@@ -1115,6 +1392,7 @@
   const NAV = [
     { id: 'today', ic: '▣', label: 'Today' },
     { id: 'pick', ic: '☰', label: 'Exercises' },
+    { id: 'coach', ic: '◈', label: 'Coach' },
     { id: 'history', ic: '◷', label: 'History' },
     { id: 'data', ic: '⇅', label: 'Data' },
   ];
@@ -1127,6 +1405,8 @@
       case 'history': return historyView();
       case 'routines': return routinesView();
       case 'workout': return workoutView(view.id);
+      case 'coach': return coachView();
+      case 'profile': return profileView();
       case 'data': return dataView();
       default: return todayView();
     }
@@ -1134,7 +1414,7 @@
 
   function render() {
     const v = currentView();
-    const navActive = ['today', 'pick', 'history', 'data'].includes(view.name) ? view.name : null;
+    const navActive = ['today', 'pick', 'coach', 'history', 'data'].includes(view.name) ? view.name : null;
     $app.innerHTML = `
       <div class="topbar">
         ${v.back ? `<button class="back" data-back="${v.back}"${v.backExercise ? ` data-exercise="${esc(v.backExercise)}"` : ''} aria-label="Back">‹</button>` : ''}
@@ -1277,6 +1557,57 @@
     w.exercises = next;
     save();
     toast('Order saved.');
+  }
+
+  // The coach can propose structural changes, but only from this fixed
+  // vocabulary — an accepted proposal is applied by the app, not executed as
+  // whatever the agent felt like writing. Anything unrecognised is shown and
+  // dismissed rather than applied.
+  function applyProposal(p) {
+    const pl = p.payload || {};
+    switch (p.kind) {
+      case 'add-exercise': {
+        if (!pl.name) return false;
+        state.exercises[pl.name] = {
+          category: pl.category || 'Uncategorized',
+          kind: 'weight',
+          ...(pl.equipment ? { equipment: pl.equipment } : {}),
+        };
+        return true;
+      }
+      case 'set-progression': {
+        if (!pl.exercise) return false;
+        state.settings[pl.exercise] = Object.assign({}, settingsFor(pl.exercise), pl.settings || {});
+        return true;
+      }
+      case 'add-workout': {
+        const r = state.routines.find(x => x.id === pl.routineId || x.name === pl.routine);
+        if (!r || !pl.name) return false;
+        r.workouts = [...(r.workouts || []), { id: uid(), name: pl.name, exercises: pl.exercises || [] }];
+        for (const n of pl.exercises || []) if (!state.exercises[n]) state.exercises[n] = { category: 'Uncategorized' };
+        return true;
+      }
+      case 'set-workout-exercises': {
+        const w = workoutById(pl.workoutId);
+        if (!w || !Array.isArray(pl.exercises)) return false;
+        w.exercises = pl.exercises;
+        for (const n of pl.exercises) if (!state.exercises[n]) state.exercises[n] = { category: 'Uncategorized' };
+        return true;
+      }
+      case 'add-routine': {
+        if (!pl.name) return false;
+        state.routines.push({
+          id: uid(), name: pl.name, weeks: pl.weeks || null,
+          workouts: (pl.workouts || []).map(w => ({ id: uid(), name: w.name, exercises: w.exercises || [] })),
+        });
+        for (const w of pl.workouts || []) for (const n of w.exercises || []) {
+          if (!state.exercises[n]) state.exercises[n] = { category: 'Uncategorized' };
+        }
+        return true;
+      }
+      default:
+        return false;   // advice-only, e.g. "take a deload week"
+    }
   }
 
   function act(what, data) {
@@ -1430,6 +1761,9 @@
           for (const [name, meta] of Object.entries(exercises)) {
             if (!state.exercises[name] || categoryOf(name) === 'Uncategorized') state.exercises[name] = meta;
           }
+          // A bulk swap is a wholesale replace, so it must win the next sync
+          // rather than be merged set-by-set against the server's copy.
+          state.epoch = (state.epoch || 1) + 1;
           if (save()) { render(); toast(`Imported ${sets.length} sets, ${Object.keys(exercises).length} exercises.`); }
         };
         reader.onerror = () => toast('Could not read that file.');
@@ -1458,6 +1792,7 @@
           if (state.sets.length || state.routines.length) {
             if (!confirm(`Replace everything in this app with ${summary} from the backup?`)) return;
           }
+          next.epoch = (state.epoch || 1) + 1;
           state = next;
           if (save()) { go('today'); toast(`Restored ${summary}.`); }
         };
@@ -1488,6 +1823,49 @@
         save(); render(); toast('Cleared.');
         return;
       }
+      case 'save-sync': {
+        const repo = document.getElementById('sync-repo').value.trim();
+        const tokenField = document.getElementById('sync-token').value.trim();
+        if (repo && !/^[\w.-]+\/[\w.-]+$/.test(repo)) { toast('Repo should look like owner/name.'); return; }
+        sync.repo = repo;
+        // The field shows dots for an existing token; only overwrite on a real entry.
+        if (tokenField && !/^•+$/.test(tokenField)) sync.token = tokenField;
+        sync.sha = null;
+        saveSync(sync);
+        syncNote = '';
+        render(); toast('Saved.');
+        return;
+      }
+      case 'sync-now': {
+        if (!syncConfigured()) { toast('Add the repo and token first.'); return; }
+        runSync();
+        return;
+      }
+      case 'save-profile': {
+        state.profile = {
+          goals: document.getElementById('p-goals').value.trim(),
+          equipment: document.getElementById('p-equipment').value.trim(),
+          schedule: document.getElementById('p-schedule').value.trim(),
+          injuries: document.getElementById('p-injuries').value.trim(),
+        };
+        save(); go('data'); toast('Saved.');
+        return;
+      }
+      case 'accept-proposal': {
+        const p = (state.coachProposals || []).find(x => x.id === data.id);
+        if (!p) return;
+        const applied = applyProposal(p);
+        state.coachProposals = state.coachProposals.filter(x => x.id !== data.id);
+        state.epoch = (state.epoch || 1) + 1;
+        save(); render();
+        toast(applied ? 'Applied.' : 'Noted — nothing to change automatically.');
+        return;
+      }
+      case 'dismiss-proposal': {
+        state.coachProposals = (state.coachProposals || []).filter(x => x.id !== data.id);
+        save(); render();
+        return;
+      }
       case 'save-prefs': {
         const inc = parseFloat(document.getElementById('pref-inc').value);
         state.prefs.increment = Number.isFinite(inc) && inc > 0 ? inc : 1.25;
@@ -1496,7 +1874,11 @@
       }
       case 'wipe': {
         if (!confirm('Erase all logged sets, exercises and routines on this device? Export first if you want a copy.')) return;
+        const epoch = (state.epoch || 1) + 1;
         state = structuredClone(BLANK);
+        // Carry the epoch forward so an erase propagates rather than being
+        // treated as an empty client and silently refilled from the server.
+        state.epoch = epoch;
         save(); go('today'); toast('Erased.');
         return;
       }
@@ -1504,6 +1886,14 @@
   }
 
   render();
+
+  // Opportunistic sync: on open, when connectivity returns, and when the app
+  // comes back to the foreground. Never blocking, and silent unless it fails.
+  if (syncConfigured()) runSync({ quiet: true });
+  window.addEventListener('online', () => runSync({ quiet: true }));
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') runSync({ quiet: true });
+  });
 
   if ('serviceWorker' in navigator) {
     window.addEventListener('load', () => {

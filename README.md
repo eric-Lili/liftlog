@@ -98,11 +98,47 @@ it, so export now and then:
 - **Data → Download CSV** — sets only, in FitNotes' own format, for feeding the
   Ledger coaching app or moving back to FitNotes.
 
-## Coach suggestions
+## Sync and the coach
 
-The `coachSuggestions` JSON from the Ledger app can be pasted under
-**Data → Coach suggestions**. Those override the built-in calculation and show
-as "Coach suggests", with the auto-calculated figure still visible underneath.
+LiftLog keeps a copy of your training as `state.json` in a **private** GitHub
+repo. That file is the shared surface: the app writes your training to it, and
+the coaching agent reads it and writes an assessment back.
+
+Ownership is structural rather than by agreement:
+
+```
+state.json
+  app     sets, exercises, routines, sessions, settings, goals, profile, prefs
+          — written only by LiftLog
+  coach   brief, suggestions, proposals
+          — written only by the coach
+```
+
+A push carries the remote's own `coach` block back untouched, so neither side
+can clobber the other. An `epoch` counter settles the rest: it increments on any
+wholesale replace (CSV import, restore, erase), and the higher epoch wins. An
+empty client never overwrites a non-empty server — browsers evict storage, and a
+returning-empty app must not destroy your history.
+
+**Setup:** create a private repo, then create a fine-grained token scoped to
+**that repo only**, Contents: read & write. Enter both under **Data → Sync**.
+
+Do **not** give the token access to the `liftlog` repo. Every GitHub Pages site
+on an account shares one origin, and `localStorage` is keyed by origin — a token
+that could rewrite the app itself would be a real problem. Scoped correctly the
+worst case is that someone reads your training.
+
+The token is stored under its own key, so it never appears in a backup file or
+in the synced data.
+
+### What the coach can do
+
+The **Coach** tab shows its written assessment, any per-exercise calls (which
+replace the app's own suggestion for that lift), and **proposals** — structural
+changes like adding an exercise, changing a progression rule, or reworking a
+workout. Proposals are applied by the app from a fixed vocabulary only when you
+accept them; an unrecognised one is inert. Nothing the agent writes changes your
+programme on its own.
 
 ## Development
 
@@ -114,6 +150,8 @@ Plain HTML, CSS and JavaScript — no build step and no dependencies.
 - `manifest.webmanifest` — PWA manifest
 - `tools/fitnotes-to-liftlog.py` — converts a `.fitnotes` backup to a LiftLog
   backup file (standard library only)
+- `tools/coach-io.py` — reads the synced state and writes back the coach block,
+  refusing to touch anything the app owns
 
 To test locally, serve the directory over HTTP (service workers don't run from
 `file://`):
