@@ -5,6 +5,22 @@ suggestions. Built as a companion to FitNotes — it imports your FitNotes
 export and carries on from there, adding the one thing FitNotes doesn't do:
 telling you what to load next.
 
+## How the pieces are named
+
+```
+Routine      a complete programme, run for a block of weeks
+  Workout      one session's worth of work, exercises in a fixed order
+    Exercise     position within the workout matters
+      Set          weight × reps — weight may be negative
+
+Session      one performance of a Workout. Starts when you log the first
+             set, ends when you tap Complete, and owns the sets between.
+```
+
+Reordering exercises during a session is saved back to the **workout**, so the
+order sticks next time. Skipping one — a broken machine, a day you don't feel
+like it — applies to **that session only** and leaves the workout alone.
+
 ## Why
 
 FitNotes is a good logger but has no progression logic — you decide the
@@ -24,7 +40,20 @@ Two rules, picked per exercise:
 
 Compound lifts are classified as heavy automatically by name; everything else
 defaults to accessory. Either can be overridden per exercise, along with the
-increment, cadence and rep range, under **Progression settings**.
+equipment, increment, cadence and rep range, under **Progression settings**.
+
+**Equipment decides what is loadable.** A barbell takes plates on both ends, so
+with 1.25 kg plates its smallest real jump is 2.5 kg — suggesting 96.25 kg for a
+squat is useless because it cannot be built. Barbell lifts therefore progress in
+twice-the-smallest-plate steps and show the per-side breakdown. Because a name
+alone cannot tell a back squat from an EZ-bar curl, the bar assumption is
+checked against your own history: if what you have logged for a lift can't be
+built from the configured bar and plates, LiftLog stops making plate claims
+about it and falls back to the generic increment.
+
+On an **assisted** machine the number is help rather than load, so log it
+negative; progress there runs toward zero and the app words it as "less
+assistance" rather than "+2.5 kg".
 
 Suggestions read the top weight of your last session. Heavy lifts keep the rep
 count you actually work at (the most common across those sets), so one short

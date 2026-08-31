@@ -7,8 +7,8 @@ export this carries routines, categories and per-exercise weight increments.
 
 
 FitNotes models a routine as a set of named sections (typically the days of a
-split); LiftLog routines are flat, so each section becomes its own routine,
-prefixed with the FitNotes routine name when there is more than one section.
+split), which maps directly onto LiftLog: a Routine is the programme, and each
+section becomes a Workout inside it.
 
 Only weight x reps sets are carried over — FitNotes' duration and distance
 entries (planks, farmers walks, cardio) have no equivalent in LiftLog. The
@@ -45,39 +45,36 @@ for r in db.execute("select _id, name, category_id, exercise_type_id, weight_inc
         settings[name] = {"increment": float(r["weight_increment"])}
 
 # ----------------------------------------------------------------- routines
+# FitNotes nests days inside a routine as "sections", which is the same shape
+# LiftLog uses: a Routine is the programme, and each Workout inside it is one
+# session's work.
 routines = []
-section_counts = {}
-for r in db.execute("select routine_id, count(*) n from RoutineSection group by routine_id"):
-    section_counts[r["routine_id"]] = r["n"]
-
-sections = db.execute(
-    """select rs._id sid, rs.name sname, rt._id rid, rt.name rname
-       from RoutineSection rs join Routine rt on rt._id = rs.routine_id
-       order by rt._id, rs.sort_order"""
-).fetchall()
-
-for s in sections:
-    members = [
-        ex_by_id[r["exercise_id"]]
-        for r in db.execute(
-            """select exercise_id from RoutineSectionExercise
-               where routine_section_id = ? order by sort_order""",
-            (s["sid"],),
-        )
-        if r["exercise_id"] in ex_by_id
-    ]
-    if not members:
-        continue
-    multi = section_counts.get(s["rid"], 0) > 1
-    name = f"{s['rname']} · {s['sname']}" if multi else s["rname"]
-    routines.append({"name": name, "exercises": members})
+for rt in db.execute("select _id, name, notes from Routine order by _id"):
+    workouts = []
+    for s in db.execute(
+        "select _id, name from RoutineSection where routine_id = ? order by sort_order",
+        (rt["_id"],),
+    ):
+        members = [
+            ex_by_id[r["exercise_id"]]
+            for r in db.execute(
+                """select exercise_id from RoutineSectionExercise
+                   where routine_section_id = ? order by sort_order""",
+                (s["_id"],),
+            )
+            if r["exercise_id"] in ex_by_id
+        ]
+        if members:
+            workouts.append({"id": f"w{s['_id']}", "name": s["name"], "exercises": members})
+    if workouts:
+        routines.append({"id": f"r{rt['_id']}", "name": rt["name"], "weeks": None, "workouts": workouts})
 
 # --------------------------------------------------------------------- sets
 # reps > 0 keeps bodyweight work (0 kg pull-ups) while dropping the
 # duration/distance rows, which carry reps = 0.
 sets = []
 for r in db.execute(
-    """select t.date, t.exercise_id, t.metric_weight w, t.reps
+    """select t._id, t.date, t.exercise_id, t.metric_weight w, t.reps
        from training_log t join exercise e on e._id = t.exercise_id
        where e.exercise_type_id = 0 and t.reps > 0
        order by t.date, t._id"""
@@ -86,14 +83,27 @@ for r in db.execute(
     if not name:
         continue
     weight = round(float(r["w"]), 2)
-    sets.append([r["date"], name, int(weight) if weight == int(weight) else weight, int(r["reps"])])
+    sets.append({
+        # Ids are derived from FitNotes' own row ids so re-running the converter
+        # produces the same identities rather than fresh random ones.
+        "id": f"fn{r['_id']}",
+        "date": r["date"],
+        "exercise": name,
+        "weight": int(weight) if weight == int(weight) else weight,
+        "reps": int(r["reps"]),
+        "notes": "",
+        "src": "fitnotes",
+    })
 
 payload = {
     "format": "liftlog-backup",
-    "version": 1,
+    "version": 2,
     "exercises": exercises,
     "settings": settings,
     "routines": routines,
+    "sessions": [],
+    "goals": [],
+    "coachSuggestions": {},
     "sets": sets,
 }
 
@@ -103,5 +113,5 @@ with open(OUT, "w", encoding="utf-8") as fh:
 print(f"exercises: {len(exercises)}")
 print(f"  with explicit increment: {len(settings)}")
 print(f"  duration/distance (kind=other): {sum(1 for e in exercises.values() if e['kind'] == 'other')}")
-print(f"routines: {len(routines)}")
-print(f"sets: {len(sets)}  ({sets[0][0]} .. {sets[-1][0]})")
+print(f"routines: {len(routines)}  ({sum(len(r['workouts']) for r in routines)} workouts)")
+print(f"sets: {len(sets)}  ({sets[0]['date']} .. {sets[-1]['date']})")

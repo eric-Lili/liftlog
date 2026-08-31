@@ -166,6 +166,30 @@
     z-index: 30; max-width: calc(100vw - 2rem); text-align: center;
   }
   .toast.show { opacity: 1; }
+
+  /* a row's tappable area, when the row also carries a handle or side button */
+  .rowbtn {
+    background: none; border: none; padding: 0; text-align: left; cursor: pointer;
+    color: inherit; min-width: 0; flex: 1;
+  }
+  .grip {
+    flex: none; color: var(--ink-soft); font-size: 1.2rem; line-height: 1; cursor: grab;
+    padding: 0.35rem 0.2rem; touch-action: none; user-select: none;
+  }
+  .drag-item { transition: transform 0.12s ease, box-shadow 0.12s ease; }
+  .drag-item.dragging {
+    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.28); border-color: var(--clay);
+    position: relative; z-index: 5; transition: none;
+  }
+  .dragging-active { cursor: grabbing; }
+  .dragging-active .drag-item:not(.dragging) { opacity: 0.7; }
+
+  .plates {
+    margin-top: 0.5rem; padding-top: 0.5rem; border-top: 1px solid var(--rule);
+    font-size: 0.82rem; color: var(--ink-soft); font-variant-numeric: tabular-nums;
+  }
+  .plates.warn { color: var(--danger); font-weight: 600; }
+
   @media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
 </style>
 </head>
@@ -177,13 +201,56 @@
 
   // ---------------------------------------------------------------- storage
   const KEY = 'liftlog.v1';
-  const BLANK = { sets: [], exercises: {}, routines: [], settings: {}, coachSuggestions: {}, plan: null, prefs: { increment: 1.25 } };
+  const SCHEMA = 2;
+
+  // The hierarchy, in the terms the training actually uses:
+  //   Routine   a complete programme run for a block of weeks
+  //     Workout   one session's worth of work, exercises in a fixed order
+  //       (performed as a) Session, which owns the sets logged against it
+  const BLANK = {
+    schemaVersion: SCHEMA,
+    sets: [],           // { id, date, exercise, weight, reps, notes, src, sessionId }
+    exercises: {},      // name -> { category, kind, equipment }
+    routines: [],       // { id, name, weeks, workouts: [{ id, name, exercises: [name] }] }
+    sessions: [],       // { id, date, routineId, workoutId, name, startedAt, endedAt }
+    active: null,       // { sessionId, skipped: [name] } while a workout is underway
+    settings: {},
+    coachSuggestions: {},
+    goals: [],
+    prefs: { increment: 1.25, bar: 20, plates: [20, 15, 10, 5, 2.5, 1.25] },
+  };
+
+  // v1 stored a flat `routines` list whose entries were really *workouts*, named
+  // "Routine · Workout" by the FitNotes converter. Split them back apart rather
+  // than making the user re-import.
+  function migrate(old) {
+    if (!old || old.schemaVersion >= SCHEMA) return old;
+    const next = Object.assign(structuredClone(BLANK), old, { schemaVersion: SCHEMA });
+    const byRoutine = new Map();
+    for (const r of old.routines || []) {
+      const [routineName, workoutName] = r.name.includes(' · ')
+        ? [r.name.slice(0, r.name.indexOf(' · ')), r.name.slice(r.name.indexOf(' · ') + 3)]
+        : [r.name, r.name];
+      if (!byRoutine.has(routineName)) byRoutine.set(routineName, { id: uid(), name: routineName, weeks: null, workouts: [] });
+      byRoutine.get(routineName).workouts.push({ id: r.id || uid(), name: workoutName, exercises: r.exercises || [] });
+    }
+    next.routines = [...byRoutine.values()];
+    next.sessions = [];
+    next.active = null;
+    delete next.plan;
+    return next;
+  }
 
   function load() {
     try {
       const raw = localStorage.getItem(KEY);
       if (!raw) return structuredClone(BLANK);
-      return Object.assign(structuredClone(BLANK), JSON.parse(raw));
+      const parsed = JSON.parse(raw);
+      const merged = Object.assign(structuredClone(BLANK), parsed);
+      // Take the version from what was stored — BLANK's would mask it and the
+      // migration would silently never run.
+      merged.schemaVersion = parsed.schemaVersion || 1;
+      return migrate(merged);
     } catch (err) {
       console.error('load failed', err);
       return structuredClone(BLANK);
@@ -238,6 +305,13 @@
   }
 
   function go(name, extra = {}) { view = Object.assign({ name }, extra); render(); window.scrollTo(0, 0); }
+  // Which dataset attributes carry through a navigation.
+  function navArgs(ds) {
+    const out = {};
+    if (ds.exercise) out.exercise = ds.exercise;
+    if (ds.id) out.id = ds.id;
+    return out;
+  }
 
   // -------------------------------------------------------------- exercises
   function exerciseNames() {
@@ -254,7 +328,9 @@
     const e = state.exercises[name];
     return !e || e.kind !== 'other';
   }
-  function sessionsFor(name) {
+  // One exercise's history, grouped by training day. (Not to be confused with a
+  // Session, which is one performance of a whole Workout.)
+  function historyFor(name) {
     const rows = state.sets.filter(s => s.exercise === name).sort((a, b) => a.date.localeCompare(b.date));
     const byDate = new Map();
     for (const r of rows) {
@@ -262,6 +338,24 @@
       byDate.get(r.date).push(r);
     }
     return [...byDate.entries()].map(([date, sets]) => ({ date, sets }));
+  }
+
+  // ---------------------------------------------------- routines / workouts
+  function workoutById(id) {
+    for (const r of state.routines) {
+      const w = (r.workouts || []).find(x => x.id === id);
+      if (w) return w;
+    }
+    return null;
+  }
+  function routineOfWorkout(id) {
+    return state.routines.find(r => (r.workouts || []).some(w => w.id === id)) || null;
+  }
+  // The session currently underway: started or staged today and not completed.
+  function activeSession() {
+    if (!state.active) return null;
+    const s = state.sessions.find(x => x.id === state.active.sessionId);
+    return s && !s.endedAt ? s : null;
   }
 
   // ------------------------------------------------------- progression rule
@@ -273,18 +367,84 @@
     return /squat|deadlift|bench|overhead press|\bohp\b|military press|barbell row|pendlay|hip thrust|clean|snatch|\bdip\b|pull[- ]?up|chin[- ]?up/i.test(name)
       ? 'heavy' : 'accessory';
   }
+
+  // Equipment decides what weights are even loadable. A barbell takes plates on
+  // BOTH ends, so with 1.25kg plates the smallest real jump is 2.5kg — which is
+  // why a flat 1.25kg default produced weights like 96.25kg that cannot be put
+  // on a bar. Assisted machines take the weight off you, so there progress runs
+  // the other way: toward zero.
+  function defaultEquipment(name) {
+    if (/assisted|assist machine/i.test(name)) return 'assisted';
+    if (/dumbbell|dumbell|goblet/i.test(name)) return 'dumbbell';
+    if (/machine|cable|pulldown|pushdown|smith/i.test(name)) return 'machine';
+    // Unilateral and loaded-carry work is nearly always dumbbells even when the
+    // name contains "squat" or "lunge".
+    if (/split squat|lunge|step[- ]?up|single|one[- ]arm|farmer/i.test(name)) return 'other';
+    if (/barbell|squat|deadlift|bench press|overhead press|good morning|zercher|shrug|clean|snatch|romanian|hip thrust/i.test(name)) return 'barbell';
+    return 'other';
+  }
+
+  // A name heuristic can only guess which bar you use — an EZ-bar curl and a
+  // back squat both read as "barbell". If what you have actually logged for a
+  // lift cannot be built from the configured bar and plates, the assumption is
+  // wrong, so stop making claims about plates for it.
+  function barFitsHistory(name) {
+    const weights = state.sets.filter(s => s.exercise === name).map(s => s.weight);
+    if (!weights.length) return true;
+    return weights.every(w => plateBreakdown(w) !== null);
+  }
+  function usesBar(name) {
+    return equipmentOf(name) === 'barbell' && barFitsHistory(name);
+  }
+  function equipmentOf(name) {
+    const s = state.settings[name] || {};
+    return s.equipment || defaultEquipment(name);
+  }
+  function smallestPlate() {
+    const p = (state.prefs.plates || []).filter(x => x > 0);
+    return p.length ? Math.min(...p) : 1.25;
+  }
+  function barWeight() {
+    return state.prefs.bar != null ? state.prefs.bar : 20;
+  }
   function settingsFor(name) {
     const s = state.settings[name] || {};
     const type = s.type || defaultType(name);
+    const equipment = s.equipment || defaultEquipment(name);
+    // A barbell's minimum jump is two plates, one per side — but only when the
+    // history says this really is that bar.
+    const naturalIncrement = equipment === 'barbell' && barFitsHistory(name)
+      ? smallestPlate() * 2
+      : (state.prefs.increment || 1.25);
     return {
       type,
-      increment: s.increment != null ? s.increment : (state.prefs.increment || 1.25),
+      equipment,
+      increment: s.increment != null ? s.increment : naturalIncrement,
       cadenceWeeks: s.cadenceWeeks != null ? s.cadenceWeeks : 1,
       repHigh: s.repHigh != null ? s.repHigh : (type === 'heavy' ? 5 : 12),
       repLow: s.repLow != null ? s.repLow : (type === 'heavy' ? 5 : 8),
     };
   }
   function roundTo(w, inc) { return Math.round(w / inc) * inc; }
+
+  // Which plates go on each side, or null when the target cannot be built from
+  // the plates on hand.
+  function plateBreakdown(total) {
+    const bar = barWeight();
+    if (total < bar) return null;
+    let perSide = (total - bar) / 2;
+    const out = [];
+    for (const p of [...(state.prefs.plates || [])].sort((a, b) => b - a)) {
+      while (perSide >= p - 1e-9) { out.push(p); perSide = Math.round((perSide - p) * 1000) / 1000; }
+    }
+    return perSide < 1e-9 ? out : null;
+  }
+  function nearestLoadable(total) {
+    const step = smallestPlate() * 2;
+    const bar = barWeight();
+    const n = Math.round((total - bar) / step);
+    return Math.max(bar, Math.round((bar + n * step) * 100) / 100);
+  }
 
   // Past this long without doing a lift, treat the next session as a re-entry
   // rather than a continuation.
@@ -305,7 +465,7 @@
   }
 
   function autoSuggest(name) {
-    const sessions = sessionsFor(name).filter(s => s.date !== ymd());
+    const sessions = historyFor(name).filter(s => s.date !== ymd());
     if (!sessions.length) return null;
     const cfg = settingsFor(name);
     const last = sessions[sessions.length - 1];
@@ -343,11 +503,11 @@
       if (weeks >= cfg.cadenceWeeks) {
         return {
           weight: roundTo(topWeight + cfg.increment, cfg.increment), reps: workReps,
-          note: `+${num(cfg.increment)}kg — you've been at ${num(topWeight)}kg for ${weeks < 1.5 ? 'a week' : Math.round(weeks) + ' weeks'}.`,
+          note: `${addedLoad(cfg)} — you've been at ${loadLabel(topWeight, cfg)} for ${weeks < 1.5 ? 'a week' : Math.round(weeks) + ' weeks'}.`,
         };
       }
       const left = Math.max(1, Math.ceil((cfg.cadenceWeeks - weeks) * 7));
-      return { weight: topWeight, reps: workReps, note: `Hold at ${num(topWeight)}kg — next bump in about ${left} day${left === 1 ? '' : 's'}.` };
+      return { weight: topWeight, reps: workReps, note: `Hold at ${loadLabel(topWeight, cfg)} — next bump in about ${left} day${left === 1 ? '' : 's'}.` };
     }
 
     if (limitReps < cfg.repHigh) {
@@ -355,13 +515,40 @@
     }
     return {
       weight: roundTo(topWeight + cfg.increment, cfg.increment), reps: cfg.repLow,
-      note: `You hit ${cfg.repHigh} reps — add ${num(cfg.increment)}kg and drop back to ${cfg.repLow}.`,
+      note: `You hit ${cfg.repHigh} reps — ${addedLoad(cfg)}, back to ${cfg.repLow} reps.`,
     };
   }
+
+  // On an assisted machine the number is help, not load, so "more weight" is
+  // actually less assistance — say that rather than "+2.5kg".
+  function addedLoad(cfg) {
+    return cfg.equipment === 'assisted'
+      ? `${num(cfg.increment)}kg less assistance`
+      : `+${num(cfg.increment)}kg`;
+  }
+  function loadLabel(w, cfg) {
+    return cfg.equipment === 'assisted' && w < 0
+      ? `${num(Math.abs(w))}kg of assistance`
+      : `${num(w)}kg`;
+  }
+
   function suggestionFor(name) {
     const auto = autoSuggest(name);
     const coach = state.coachSuggestions[name];
     return { auto, coach, shown: coach || auto };
+  }
+
+  // For barbell work, show what actually goes on each end — and say so plainly
+  // when the target cannot be built from the plates on hand.
+  function plateHint(weight, cfg, name) {
+    if (cfg.equipment !== 'barbell' || weight == null || !barFitsHistory(name)) return '';
+    const plates = plateBreakdown(weight);
+    if (plates) {
+      return `<div class="plates">Per side: ${plates.map(num).join(' + ')}${plates.length ? '' : 'empty bar'}</div>`;
+    }
+    const near = nearestLoadable(weight);
+    return `<div class="plates warn">Not loadable with your plates — nearest is ${num(near)}kg`
+      + `${plateBreakdown(near) ? ` (${plateBreakdown(near).map(num).join(' + ')} per side)` : ''}.</div>`;
   }
 
   // ---------------------------------------------------------------- CSV I/O
@@ -437,17 +624,24 @@
   }
 
   // ------------------------------------------------------------- backup I/O
-  // A full backup: everything the CSV can't carry — routines, per-exercise
-  // progression settings, categories. Sets use a compact array form
-  // [date, exercise, weight, reps] to keep the file small.
+  // A full backup: everything the CSV cannot carry — routines and their
+  // workouts, per-exercise progression settings, categories, goals, session
+  // history. Sets are written as whole objects: v1 wrote them as
+  // [date, exercise, weight, reps], which silently dropped `notes` and `src`
+  // and — because a restore then relabelled every set `src: 'fitnotes'` — let a
+  // later CSV import delete everything ever logged in the app.
   function toBackup() {
     return JSON.stringify({
       format: 'liftlog-backup',
-      version: 1,
+      version: 2,
       exercises: state.exercises,
       settings: state.settings,
-      routines: state.routines.map(r => ({ name: r.name, exercises: r.exercises })),
-      sets: state.sets.map(s => [s.date, s.exercise, s.weight, s.reps]),
+      routines: state.routines,
+      sessions: state.sessions,
+      goals: state.goals,
+      coachSuggestions: state.coachSuggestions,
+      prefs: state.prefs,
+      sets: state.sets,
     });
   }
 
@@ -459,19 +653,37 @@
     if (!Array.isArray(p.sets) || !p.exercises) throw new Error('backup is missing data');
 
     const next = structuredClone(BLANK);
-    next.prefs = Object.assign(structuredClone(BLANK.prefs), state.prefs);
+    next.prefs = Object.assign(structuredClone(BLANK.prefs), state.prefs, p.prefs || {});
     for (const [name, meta] of Object.entries(p.exercises)) {
-      next.exercises[name] = { category: (meta && meta.category) || 'Uncategorized', kind: (meta && meta.kind) || 'weight' };
+      next.exercises[name] = {
+        category: (meta && meta.category) || 'Uncategorized',
+        kind: (meta && meta.kind) || 'weight',
+        ...(meta && meta.equipment ? { equipment: meta.equipment } : {}),
+      };
     }
-    for (const [name, cfg] of Object.entries(p.settings || {})) {
-      next.settings[name] = cfg;
-    }
-    next.routines = (p.routines || [])
-      .filter(r => r && r.name)
-      .map(r => ({ id: uid(), name: r.name, exercises: Array.isArray(r.exercises) ? r.exercises : [] }));
-    next.sets = p.sets
-      .filter(s => Array.isArray(s) && s.length >= 4 && Number.isFinite(+s[2]) && Number.isFinite(+s[3]))
-      .map(s => ({ id: uid(), date: String(s[0]), exercise: String(s[1]), weight: +s[2], reps: +s[3], notes: '', src: 'fitnotes' }));
+    for (const [name, cfg] of Object.entries(p.settings || {})) next.settings[name] = cfg;
+    next.coachSuggestions = p.coachSuggestions || {};
+    next.goals = Array.isArray(p.goals) ? p.goals : [];
+    next.sessions = Array.isArray(p.sessions) ? p.sessions : [];
+
+    next.routines = (p.routines || []).filter(r => r && r.name).map(r => (
+      Array.isArray(r.workouts)
+        ? { id: r.id || uid(), name: r.name, weeks: r.weeks ?? null, workouts: r.workouts.map(w => ({ id: w.id || uid(), name: w.name, exercises: Array.isArray(w.exercises) ? w.exercises : [] })) }
+        // v1 shape: a flat list whose entries were really workouts.
+        : { id: uid(), name: r.name, weeks: null, workouts: [{ id: uid(), name: r.name, exercises: Array.isArray(r.exercises) ? r.exercises : [] }] }
+    ));
+
+    next.sets = p.sets.map(s => (
+      Array.isArray(s)
+        // v1 compact form — no id, notes or src survived the export.
+        ? (s.length >= 4 && Number.isFinite(+s[2]) && Number.isFinite(+s[3])
+            ? { id: uid(), date: String(s[0]), exercise: String(s[1]), weight: +s[2], reps: +s[3], notes: '', src: 'fitnotes' }
+            : null)
+        : (s && Number.isFinite(+s.weight) && Number.isFinite(+s.reps)
+            ? { id: s.id || uid(), date: String(s.date), exercise: String(s.exercise), weight: +s.weight, reps: +s.reps, notes: s.notes || '', src: s.src || 'fitnotes', ...(s.sessionId ? { sessionId: s.sessionId } : {}) }
+            : null)
+    )).filter(Boolean);
+
     return next;
   }
 
@@ -487,36 +699,61 @@
   function todayView() {
     const today = ymd();
     const todaySets = state.sets.filter(s => s.date === today);
+    const session = activeSession();
+    const workout = session ? workoutById(session.workoutId) : null;
+    const skipped = (state.active && state.active.skipped) || [];
+
+    // Exercises to show: the workout's own order, minus anything skipped, plus
+    // anything logged today that the workout didn't call for.
+    const planned = workout ? workout.exercises.filter(e => !skipped.includes(e)) : [];
     const logged = [...new Set(todaySets.map(s => s.exercise))];
-    const planned = (state.plan && state.plan.date === today) ? state.plan.exercises : [];
     const order = [...planned, ...logged.filter(e => !planned.includes(e))];
 
     const list = order.length ? `
-      <div class="list-stack">
+      <div class="list-stack" id="today-list">
         ${order.map(name => {
           const sets = todaySets.filter(s => s.exercise === name);
           const sug = suggestionFor(name).shown;
+          const inWorkout = workout && workout.exercises.includes(name);
           return `
-          <button class="list-item" data-go="log" data-exercise="${esc(name)}">
-            <div class="grow">
+          <div class="list-item drag-item" data-exercise="${esc(name)}"${inWorkout ? ' data-draggable="1"' : ''}>
+            ${inWorkout ? '<span class="grip" data-grip aria-hidden="true">⠿</span>' : ''}
+            <button class="grow rowbtn" data-go="log" data-exercise="${esc(name)}">
               <div class="name">${esc(name)}</div>
               <div class="meta mono">${sets.length
                 ? sets.map(s => `${num(s.weight)}×${s.reps}`).join('  ·  ')
                 : (sug ? `Target ${num(sug.weight)}kg × ${sug.reps}` : 'No history yet')}</div>
-            </div>
-            ${sets.length ? `<span class="chip done">${sets.length} set${sets.length === 1 ? '' : 's'}</span>` : '<span class="chip">to do</span>'}
-            <span class="chev">›</span>
-          </button>`;
+            </button>
+            ${sets.length ? `<span class="chip done">${sets.length}</span>` : '<span class="chip">to do</span>'}
+            ${inWorkout && !sets.length ? `<button class="x" data-act="skip-exercise" data-exercise="${esc(name)}" aria-label="Skip ${esc(name)} today">×</button>` : ''}
+          </div>`;
         }).join('')}
-      </div>` : '<div class="empty">Nothing logged yet today.<br>Add an exercise or start a routine.</div>';
+      </div>` : '<div class="empty">Nothing logged yet today.<br>Start a workout, or add a single exercise.</div>';
+
+    const dur = session && session.startedAt
+      ? `Started ${new Date(session.startedAt).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })}`
+      : 'Not started — logging your first set starts the clock';
 
     return {
-      title: 'Today',
-      sub: new Date().toLocaleDateString(undefined, { weekday: 'long', day: 'numeric', month: 'long' }),
+      title: session ? (workout ? workout.name : 'Workout') : 'Today',
+      sub: session
+        ? dur
+        : new Date().toLocaleDateString(undefined, { weekday: 'long', day: 'numeric', month: 'long' }),
       html: `
+        ${session && workout ? `<div class="card" style="padding:0.6rem 0.9rem">
+          <div class="eyebrow">In progress${session.routineName ? ' · ' + esc(session.routineName) : ''}</div>
+          ${workout.exercises.length > 1 ? '<div class="muted" style="margin-top:0.2rem">Hold the ⠿ handle to reorder — the new order is saved to this workout.</div>' : ''}
+        </div>` : ''}
+
         ${list}
-        <button class="btn" data-go="pick">+ Add exercise</button>
-        <button class="btn ghost" data-go="routines">${state.routines.length ? 'Start a routine' : 'Set up routines'}</button>
+
+        ${skipped.length ? `<div class="card muted">Skipped today: ${skipped.map(esc).join(', ')}
+          <div style="margin-top:0.5rem"><button class="btn small ghost" data-act="unskip-all">Bring them back</button></div></div>` : ''}
+
+        <button class="btn ghost" data-go="pick">+ Add an exercise</button>
+        ${session
+          ? `<button class="btn" data-act="complete-session">Complete workout</button>`
+          : `<button class="btn" data-go="routines">${state.routines.length ? 'Start a workout' : 'Set up a routine'}</button>`}
       `,
     };
   }
@@ -525,7 +762,7 @@
     const today = ymd();
     const { auto, coach, shown } = suggestionFor(name);
     const todaySets = state.sets.filter(s => s.date === today && s.exercise === name);
-    const prev = sessionsFor(name).filter(s => s.date !== today).pop();
+    const prev = historyFor(name).filter(s => s.date !== today).pop();
     const cfg = settingsFor(name);
 
     const startW = todaySets.length ? todaySets[todaySets.length - 1].weight : (shown ? shown.weight : 20);
@@ -547,6 +784,7 @@
             <div class="eyebrow">${coach ? 'Coach suggests' : 'Suggested next'}</div>
             <div class="big mono">${num(shown.weight)} kg × ${shown.reps}</div>
             <div class="why">${esc(shown.note || '')}${coach && auto ? `<br><span class="muted">Auto-calc said ${num(auto.weight)}kg × ${auto.reps}.</span>` : ''}</div>
+            ${plateHint(shown.weight, cfg, name)}
           </div>`
         : (isWeightExercise(name) ? '<div class="card muted">First time logging this one — put in what you do and suggestions start from your next session.</div>' : '')}
 
@@ -654,6 +892,18 @@
           </p>
         </div>
         <div class="card">
+          <label class="field-label" for="s-equip">Equipment</label>
+          <select id="s-equip">
+            ${['barbell', 'dumbbell', 'machine', 'assisted', 'other'].map(e =>
+              `<option value="${e}" ${cfg.equipment === e ? 'selected' : ''}>${e[0].toUpperCase() + e.slice(1)}</option>`).join('')}
+          </select>
+          <p class="muted" style="margin:0.7rem 0 0;line-height:1.5">
+            A <strong>barbell</strong> takes plates on both ends, so its smallest real jump is twice your smallest
+            plate (${num(smallestPlate() * 2)}kg) — suggestions are rounded to something you can actually load.
+            On an <strong>assisted</strong> machine the weight is help, so log it negative and progress runs toward zero.
+          </p>
+        </div>
+        <div class="card">
           <div class="row">
             <div>
               <label class="field-label" for="s-inc">Increment (kg)</label>
@@ -702,33 +952,91 @@
     };
   }
 
+  // A routine is the programme; the workouts inside it are what you actually do
+  // on a given day. Picking a workout here starts a session.
   function routinesView() {
-    const today = ymd();
+    const session = activeSession();
     return {
       title: 'Routines', back: 'today',
       html: `
-        ${state.routines.length ? `<div class="list-stack">${state.routines.map(r => `
+        ${session ? `<div class="card muted">A workout is already in progress. Starting another will leave that one
+          open — finish it from the Today tab first if you meant to.</div>` : ''}
+
+        ${state.routines.length ? state.routines.map(r => `
           <div class="card">
             <div style="display:flex;align-items:flex-start;gap:0.6rem">
               <div style="flex:1;min-width:0">
                 <div style="font-weight:650">${esc(r.name)}</div>
-                <div class="muted" style="margin-top:0.15rem">${esc(r.exercises.join(', ') || 'No exercises')}</div>
+                <div class="muted" style="margin-top:0.15rem">
+                  ${(r.workouts || []).length} workout${(r.workouts || []).length === 1 ? '' : 's'}${r.weeks ? ` · ${r.weeks} weeks` : ''}
+                </div>
               </div>
               <button class="x" data-act="del-routine" data-id="${r.id}" aria-label="Delete routine">×</button>
             </div>
-            <div style="margin-top:0.7rem">
-              <button class="btn small" data-act="start-routine" data-id="${r.id}">${state.plan && state.plan.date === today && state.plan.routineId === r.id ? 'Restart today' : 'Start'}</button>
+            <div class="list-stack" style="margin-top:0.7rem">
+              ${(r.workouts || []).map(w => `
+                <div class="list-item">
+                  <button class="grow rowbtn" data-go="workout" data-id="${w.id}">
+                    <div class="name">${esc(w.name)}</div>
+                    <div class="meta">${w.exercises.length ? esc(w.exercises.join(', ')) : 'No exercises yet'}</div>
+                  </button>
+                  <button class="btn small" data-act="start-workout" data-id="${w.id}">Start</button>
+                </div>`).join('') || '<div class="muted">No workouts yet.</div>'}
             </div>
-          </div>`).join('')}</div>` : '<div class="empty">No routines yet.<br>Create one below — it pre-fills your Today screen.</div>'}
+            <div style="margin-top:0.6rem">
+              <button class="btn small ghost" data-act="add-workout" data-id="${r.id}">+ Add workout</button>
+            </div>
+          </div>`).join('')
+        : '<div class="empty">No routines yet.<br>A routine is a programme — a set of workouts you run for a block of weeks.</div>'}
+
         <div class="card">
           <div class="eyebrow">New routine</div>
-          <div style="margin-top:0.5rem"><input type="text" id="rt-name" placeholder="e.g. Upper Push"></div>
-          <div style="margin-top:0.6rem">
-            <label class="field-label" for="rt-exercises">Exercises (one per line)</label>
-            <textarea id="rt-exercises" placeholder="Bench Press&#10;Lat Pulldown&#10;Triceps Pushdown"></textarea>
+          <div style="margin-top:0.5rem"><input type="text" id="rt-name" placeholder="e.g. Moose 2"></div>
+          <div class="row" style="margin-top:0.5rem">
+            <div><label class="field-label" for="rt-weeks">Length (weeks, optional)</label>
+              <input type="text" id="rt-weeks" inputmode="numeric" placeholder="12"></div>
           </div>
           <div style="margin-top:0.6rem"><button class="btn" data-act="add-routine">Create routine</button></div>
         </div>
+      `,
+    };
+  }
+
+  // Editing one workout: its name and its ordered exercise list.
+  function workoutView(id) {
+    const w = workoutById(id);
+    if (!w) return { title: 'Workout', back: 'routines', html: '<div class="empty">That workout no longer exists.</div>' };
+    const r = routineOfWorkout(id);
+    return {
+      title: w.name, sub: r ? r.name : '', back: 'routines',
+      html: `
+        <div class="card">
+          <label class="field-label" for="w-name">Workout name</label>
+          <input type="text" id="w-name" value="${esc(w.name)}">
+          <div style="margin-top:0.6rem"><button class="btn small ghost" data-act="rename-workout" data-id="${w.id}">Save name</button></div>
+        </div>
+
+        <div class="card">
+          <div class="eyebrow">Exercises, in order</div>
+          ${w.exercises.length ? `<div class="list-stack" id="workout-list" style="margin-top:0.5rem">
+            ${w.exercises.map(n => `
+              <div class="list-item drag-item" data-exercise="${esc(n)}" data-draggable="1">
+                <span class="grip" data-grip aria-hidden="true">⠿</span>
+                <div class="grow"><div class="name">${esc(n)}</div></div>
+                <button class="x" data-act="remove-from-workout" data-id="${w.id}" data-exercise="${esc(n)}" aria-label="Remove">×</button>
+              </div>`).join('')}
+          </div>
+          <div class="muted" style="margin-top:0.5rem">Hold the ⠿ handle to reorder.</div>`
+          : '<div class="muted" style="margin-top:0.4rem">No exercises yet.</div>'}
+          <div style="margin-top:0.7rem">
+            <label class="field-label" for="w-add">Add an exercise</label>
+            <input type="text" id="w-add" list="exercise-names" placeholder="Start typing…">
+            <datalist id="exercise-names">${exerciseNames().map(n => `<option value="${esc(n)}">`).join('')}</datalist>
+            <div style="margin-top:0.5rem"><button class="btn small" data-act="add-to-workout" data-id="${w.id}">Add</button></div>
+          </div>
+        </div>
+
+        <button class="btn" data-act="start-workout" data-id="${w.id}">Start this workout</button>
       `,
     };
   }
@@ -818,6 +1126,7 @@
       case 'exsettings': return exSettingsView(view.exercise);
       case 'history': return historyView();
       case 'routines': return routinesView();
+      case 'workout': return workoutView(view.id);
       case 'data': return dataView();
       default: return todayView();
     }
@@ -842,11 +1151,11 @@
   // ----------------------------------------------------------------- events
   function wire() {
     $app.querySelectorAll('[data-go]').forEach(el => {
-      el.addEventListener('click', () => go(el.dataset.go, el.dataset.exercise ? { exercise: el.dataset.exercise } : {}));
+      el.addEventListener('click', () => go(el.dataset.go, navArgs(el.dataset)));
     });
     const back = $app.querySelector('[data-back]');
     if (back) {
-      back.addEventListener('click', () => go(back.dataset.back, back.dataset.exercise ? { exercise: back.dataset.exercise } : {}));
+      back.addEventListener('click', () => go(back.dataset.back, navArgs(back.dataset)));
     }
 
     $app.querySelectorAll('[data-step]').forEach(btn => {
@@ -855,9 +1164,14 @@
         if (!input) return;
         const step = parseFloat(input.step) || 1;
         const val = (parseFloat(input.value) || 0) + step * parseFloat(btn.dataset.dir);
-        input.value = num(Math.max(0, Math.round(val * 100) / 100));
+        // Reps can't go below one, but weight can go negative: on an assisted
+        // machine the number is how much help you're taking.
+        const floor = input.id === 'r' ? 1 : -Infinity;
+        input.value = num(Math.max(floor, Math.round(val * 100) / 100));
       });
     });
+
+    wireDrag();
 
     const search = document.getElementById('ex-search');
     if (search) {
@@ -873,15 +1187,189 @@
     $app.querySelectorAll('[data-act]').forEach(el => el.addEventListener('click', () => act(el.dataset.act, el.dataset)));
   }
 
+  // Hold-and-drag reordering. Deliberately pointer events rather than HTML5
+  // drag-and-drop, which does not fire reliably on touch. Press and hold the
+  // handle for a moment, then drag; the row follows your finger and the list
+  // reflows live. The resulting order is saved to the workout.
+  const HOLD_MS = 180;
+  function wireDrag() {
+    const list = document.getElementById('today-list') || document.getElementById('workout-list');
+    if (!list) return;
+
+    let held = null, holdTimer = null, startY = 0, offsetY = 0;
+
+    function rowsOf() { return [...list.querySelectorAll('.drag-item')]; }
+
+    function begin(row, y) {
+      held = row;
+      startY = y;
+      offsetY = y - row.getBoundingClientRect().top;
+      row.classList.add('dragging');
+      list.classList.add('dragging-active');
+      if (navigator.vibrate) navigator.vibrate(15);
+    }
+
+    function moveTo(y) {
+      if (!held) return;
+      const top = y - offsetY;
+      held.style.transform = `translateY(${y - startY}px)`;
+      // Swap with whichever sibling's midpoint we've crossed.
+      for (const other of rowsOf()) {
+        if (other === held) continue;
+        const box = other.getBoundingClientRect();
+        const mid = box.top + box.height / 2;
+        if (top < mid && held.compareDocumentPosition(other) & Node.DOCUMENT_POSITION_PRECEDING) {
+          list.insertBefore(held, other); resetOrigin(y); return;
+        }
+        if (top + held.offsetHeight > mid && held.compareDocumentPosition(other) & Node.DOCUMENT_POSITION_FOLLOWING) {
+          list.insertBefore(held, other.nextSibling); resetOrigin(y); return;
+        }
+      }
+    }
+    function resetOrigin(y) {
+      startY = y;
+      offsetY = y - held.getBoundingClientRect().top;
+      held.style.transform = '';
+    }
+
+    function finish() {
+      clearTimeout(holdTimer);
+      if (!held) return;
+      held.style.transform = '';
+      held.classList.remove('dragging');
+      list.classList.remove('dragging-active');
+      held = null;
+      const order = rowsOf().map(r => r.dataset.exercise);
+      commitOrder(order);
+    }
+
+    list.addEventListener('pointerdown', e => {
+      const grip = e.target.closest('[data-grip]');
+      if (!grip) return;
+      const row = grip.closest('.drag-item');
+      if (!row || !row.dataset.draggable) return;
+      e.preventDefault();
+      grip.setPointerCapture(e.pointerId);
+      holdTimer = setTimeout(() => begin(row, e.clientY), HOLD_MS);
+    });
+    list.addEventListener('pointermove', e => {
+      if (!held) { clearTimeout(holdTimer); return; }
+      e.preventDefault();
+      moveTo(e.clientY);
+    });
+    list.addEventListener('pointerup', finish);
+    list.addEventListener('pointercancel', finish);
+  }
+
+  // Persist a reordered exercise list back to the workout it belongs to.
+  function commitOrder(order) {
+    const session = activeSession();
+    const workoutId = view.name === 'workout' ? view.id : (session ? session.workoutId : null);
+    const w = workoutId && workoutById(workoutId);
+    if (!w) return;
+    // Keep any exercise the list didn't show (e.g. skipped today) in place at
+    // the end rather than dropping it from the workout.
+    const shown = order.filter(n => w.exercises.includes(n));
+    const rest = w.exercises.filter(n => !shown.includes(n));
+    const next = [...shown, ...rest];
+    const unchanged = next.length === w.exercises.length && next.every((n, i) => n === w.exercises[i]);
+    if (unchanged) return;
+    w.exercises = next;
+    save();
+    toast('Order saved.');
+  }
+
   function act(what, data) {
     switch (what) {
       case 'save-set': {
         const w = parseFloat(document.getElementById('w').value);
         const r = parseInt(document.getElementById('r').value, 10);
         if (!Number.isFinite(w) || !Number.isFinite(r) || r <= 0) { toast('Enter a weight and reps.'); return; }
-        state.sets.push({ id: uid(), date: ymd(), exercise: data.exercise, weight: w, reps: r, notes: '', src: 'app' });
+        // The session clock starts at the first set, not when the workout was
+        // picked — you often set up for a few minutes before lifting.
+        const session = activeSession();
+        if (session && !session.startedAt) session.startedAt = new Date().toISOString();
+        state.sets.push({
+          id: uid(), date: ymd(), exercise: data.exercise, weight: w, reps: r,
+          notes: '', src: 'app', ...(session ? { sessionId: session.id } : {}),
+        });
         if (!state.exercises[data.exercise]) state.exercises[data.exercise] = { category: 'Uncategorized' };
         save(); render(); toast('Set saved.');
+        return;
+      }
+      case 'start-workout': {
+        const w = workoutById(data.id);
+        if (!w) return;
+        const r = routineOfWorkout(data.id);
+        const session = { id: uid(), date: ymd(), workoutId: w.id, routineId: r ? r.id : null, name: w.name, routineName: r ? r.name : '', startedAt: null, endedAt: null };
+        state.sessions.push(session);
+        state.active = { sessionId: session.id, skipped: [] };
+        save(); go('today'); toast(`${w.name} started.`);
+        return;
+      }
+      case 'complete-session': {
+        const session = activeSession();
+        if (!session) return;
+        const logged = state.sets.filter(s => s.sessionId === session.id).length;
+        if (!logged && !confirm('No sets were logged. Close this workout anyway?')) return;
+        session.endedAt = new Date().toISOString();
+        if (!session.startedAt) session.startedAt = session.endedAt;
+        state.active = null;
+        save(); go('today');
+        toast(logged ? `Workout complete — ${logged} set${logged === 1 ? '' : 's'}.` : 'Workout closed.');
+        return;
+      }
+      case 'skip-exercise': {
+        if (!state.active) return;
+        if (!state.active.skipped.includes(data.exercise)) state.active.skipped.push(data.exercise);
+        save(); render(); toast(`Skipped ${data.exercise} today.`);
+        return;
+      }
+      case 'unskip-all': {
+        if (!state.active) return;
+        state.active.skipped = [];
+        save(); render();
+        return;
+      }
+      case 'add-workout': {
+        const r = state.routines.find(x => x.id === data.id);
+        if (!r) return;
+        const w = { id: uid(), name: `Day ${(r.workouts || []).length + 1}`, exercises: [] };
+        r.workouts = [...(r.workouts || []), w];
+        save(); go('workout', { id: w.id });
+        return;
+      }
+      case 'del-workout': {
+        const r = routineOfWorkout(data.id);
+        if (!r) return;
+        r.workouts = r.workouts.filter(w => w.id !== data.id);
+        save(); render();
+        return;
+      }
+      case 'rename-workout': {
+        const w = workoutById(data.id);
+        const name = document.getElementById('w-name').value.trim();
+        if (!w || !name) { toast('Give it a name.'); return; }
+        w.name = name;
+        save(); render(); toast('Renamed.');
+        return;
+      }
+      case 'add-to-workout': {
+        const w = workoutById(data.id);
+        const input = document.getElementById('w-add');
+        const name = input.value.trim();
+        if (!w || !name) { toast('Pick an exercise.'); return; }
+        if (!w.exercises.includes(name)) w.exercises.push(name);
+        if (!state.exercises[name]) state.exercises[name] = { category: 'Uncategorized' };
+        input.value = '';
+        save(); render();
+        return;
+      }
+      case 'remove-from-workout': {
+        const w = workoutById(data.id);
+        if (!w) return;
+        w.exercises = w.exercises.filter(n => n !== data.exercise);
+        save(); render();
         return;
       }
       case 'del-set': {
@@ -899,13 +1387,16 @@
       }
       case 'save-settings': {
         const type = document.getElementById('s-type').value;
+        const equipment = document.getElementById('s-equip').value;
         const inc = parseFloat(document.getElementById('s-inc').value);
         const cad = parseInt(document.getElementById('s-cad').value, 10);
         const lo = parseInt(document.getElementById('s-lo').value, 10);
         const hi = parseInt(document.getElementById('s-hi').value, 10);
+        const fallback = equipment === 'barbell' ? smallestPlate() * 2 : (state.prefs.increment || 1.25);
         state.settings[data.exercise] = {
           type,
-          increment: Number.isFinite(inc) && inc > 0 ? inc : 1.25,
+          equipment,
+          increment: Number.isFinite(inc) && inc > 0 ? inc : fallback,
           cadenceWeeks: Number.isFinite(cad) && cad > 0 ? cad : 1,
           repLow: Number.isFinite(lo) && lo > 0 ? lo : 8,
           repHigh: Number.isFinite(hi) && hi > 0 ? hi : 12,
@@ -915,23 +1406,17 @@
       }
       case 'add-routine': {
         const name = document.getElementById('rt-name').value.trim();
-        const exs = document.getElementById('rt-exercises').value.split('\n').map(s => s.trim()).filter(Boolean);
+        const weeks = parseInt(document.getElementById('rt-weeks').value, 10);
         if (!name) { toast('Give the routine a name.'); return; }
-        state.routines.push({ id: uid(), name, exercises: exs });
-        for (const e of exs) if (!state.exercises[e]) state.exercises[e] = { category: 'Uncategorized' };
-        save(); render(); toast('Routine created.');
+        state.routines.push({ id: uid(), name, weeks: Number.isFinite(weeks) && weeks > 0 ? weeks : null, workouts: [] });
+        save(); render(); toast('Routine created. Add its workouts next.');
         return;
       }
       case 'del-routine': {
-        state.routines = state.routines.filter(r => r.id !== data.id);
-        save(); render();
-        return;
-      }
-      case 'start-routine': {
         const r = state.routines.find(x => x.id === data.id);
-        if (!r) return;
-        state.plan = { date: ymd(), routineId: r.id, exercises: r.exercises.slice() };
-        save(); go('today'); toast(`Started ${r.name}.`);
+        if (r && (r.workouts || []).length && !confirm(`Delete "${r.name}" and its ${r.workouts.length} workouts? Logged sets are kept.`)) return;
+        state.routines = state.routines.filter(x => x.id !== data.id);
+        save(); render();
         return;
       }
       case 'import-csv': {
