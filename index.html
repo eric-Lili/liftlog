@@ -279,17 +279,36 @@
   }
   function roundTo(w, inc) { return Math.round(w / inc) * inc; }
 
+  // The rep count you actually work at: the most common one across the top-weight
+  // sets, highest wins a tie. Deliberately not the minimum — one missed rep on
+  // the last set would otherwise ratchet the target down for good.
+  function modeReps(reps) {
+    const counts = new Map();
+    for (const r of reps) counts.set(r, (counts.get(r) || 0) + 1);
+    let best = reps[0];
+    for (const [r, n] of counts) {
+      const bn = counts.get(best);
+      if (n > bn || (n === bn && r > best)) best = r;
+    }
+    return best;
+  }
+
   function autoSuggest(name) {
     const sessions = sessionsFor(name).filter(s => s.date !== ymd());
     if (!sessions.length) return null;
     const cfg = settingsFor(name);
     const last = sessions[sessions.length - 1];
     const topWeight = Math.max(...last.sets.map(s => s.weight));
-    const limitReps = Math.min(...last.sets.filter(s => s.weight === topWeight).map(s => s.reps));
+    const topReps = last.sets.filter(s => s.weight === topWeight).map(s => s.reps);
+    // Heavy: hold the rep scheme you actually work at while the weight climbs.
+    // Accessory: double progression only advances when every set clears the
+    // range, so the limiting set is the right input there.
+    const workReps = modeReps(topReps);
+    const limitReps = Math.min(...topReps);
 
     if (cfg.type === 'heavy') {
       if (sessions.length < 2) {
-        return { weight: topWeight, reps: limitReps, note: 'Repeat last session — one more data point and this starts progressing.' };
+        return { weight: topWeight, reps: workReps, note: 'Repeat last session — one more data point and this starts progressing.' };
       }
       let lastBump = sessions[0].date;
       for (let i = 1; i < sessions.length; i++) {
@@ -300,12 +319,12 @@
       const weeks = daysSince(lastBump) / 7;
       if (weeks >= cfg.cadenceWeeks) {
         return {
-          weight: roundTo(topWeight + cfg.increment, cfg.increment), reps: limitReps,
+          weight: roundTo(topWeight + cfg.increment, cfg.increment), reps: workReps,
           note: `+${num(cfg.increment)}kg — you've been at ${num(topWeight)}kg for ${weeks < 1.5 ? 'a week' : Math.round(weeks) + ' weeks'}.`,
         };
       }
       const left = Math.max(1, Math.ceil((cfg.cadenceWeeks - weeks) * 7));
-      return { weight: topWeight, reps: limitReps, note: `Hold at ${num(topWeight)}kg — next bump in about ${left} day${left === 1 ? '' : 's'}.` };
+      return { weight: topWeight, reps: workReps, note: `Hold at ${num(topWeight)}kg — next bump in about ${left} day${left === 1 ? '' : 's'}.` };
     }
 
     if (limitReps < cfg.repHigh) {
@@ -430,7 +449,8 @@
       </div>` : '<div class="empty">Nothing logged yet today.<br>Add an exercise or start a routine.</div>';
 
     return {
-      title: 'Today', sub: fmtDate(today),
+      title: 'Today',
+      sub: new Date().toLocaleDateString(undefined, { weekday: 'long', day: 'numeric', month: 'long' }),
       html: `
         ${list}
         <button class="btn" data-go="pick">+ Add exercise</button>
