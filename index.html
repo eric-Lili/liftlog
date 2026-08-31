@@ -247,6 +247,13 @@
   function categoryOf(name) {
     return (state.exercises[name] && state.exercises[name].category) || 'Uncategorized';
   }
+  // FitNotes also tracks duration and distance exercises (planks, farmers
+  // walks, cardio). LiftLog only models weight x reps, but those exercises are
+  // still imported so routines referencing them stay complete.
+  function isWeightExercise(name) {
+    const e = state.exercises[name];
+    return !e || e.kind !== 'other';
+  }
   function sessionsFor(name) {
     const rows = state.sets.filter(s => s.exercise === name).sort((a, b) => a.date.localeCompare(b.date));
     const byDate = new Map();
@@ -279,6 +286,10 @@
   }
   function roundTo(w, inc) { return Math.round(w / inc) * inc; }
 
+  // Past this long without doing a lift, treat the next session as a re-entry
+  // rather than a continuation.
+  const STALE_DAYS = 21;
+
   // The rep count you actually work at: the most common one across the top-weight
   // sets, highest wins a tie. Deliberately not the minimum — one missed rep on
   // the last set would otherwise ratchet the target down for good.
@@ -305,6 +316,18 @@
     // range, so the limiting set is the right input there.
     const workReps = modeReps(topReps);
     const limitReps = Math.min(...topReps);
+
+    // Coming back after a layoff, adding load to where you left off is wrong —
+    // you've detrained. Repeat the last session instead and progress from
+    // whatever that turns out to feel like.
+    const gap = daysSince(last.date);
+    if (gap > STALE_DAYS) {
+      const weeks = Math.round(gap / 7);
+      return {
+        weight: topWeight, reps: workReps,
+        note: `First time back in ${weeks} weeks — repeat your last session rather than adding load, and progress from there.`,
+      };
+    }
 
     if (cfg.type === 'heavy') {
       if (sessions.length < 2) {
@@ -413,8 +436,47 @@
     return rows.map(r => r.map(f => /[",\n]/.test(f) ? `"${f.replace(/"/g, '""')}"` : f).join(',')).join('\n');
   }
 
-  function download(filename, text) {
-    const url = URL.createObjectURL(new Blob([text], { type: 'text/csv' }));
+  // ------------------------------------------------------------- backup I/O
+  // A full backup: everything the CSV can't carry — routines, per-exercise
+  // progression settings, categories. Sets use a compact array form
+  // [date, exercise, weight, reps] to keep the file small.
+  function toBackup() {
+    return JSON.stringify({
+      format: 'liftlog-backup',
+      version: 1,
+      exercises: state.exercises,
+      settings: state.settings,
+      routines: state.routines.map(r => ({ name: r.name, exercises: r.exercises })),
+      sets: state.sets.map(s => [s.date, s.exercise, s.weight, s.reps]),
+    });
+  }
+
+  // A restore replaces everything, which is what "restore" should mean —
+  // unlike the CSV import, which only swaps out previously imported rows.
+  function fromBackup(text) {
+    const p = JSON.parse(text);
+    if (!p || p.format !== 'liftlog-backup') throw new Error('not a LiftLog backup file');
+    if (!Array.isArray(p.sets) || !p.exercises) throw new Error('backup is missing data');
+
+    const next = structuredClone(BLANK);
+    next.prefs = Object.assign(structuredClone(BLANK.prefs), state.prefs);
+    for (const [name, meta] of Object.entries(p.exercises)) {
+      next.exercises[name] = { category: (meta && meta.category) || 'Uncategorized', kind: (meta && meta.kind) || 'weight' };
+    }
+    for (const [name, cfg] of Object.entries(p.settings || {})) {
+      next.settings[name] = cfg;
+    }
+    next.routines = (p.routines || [])
+      .filter(r => r && r.name)
+      .map(r => ({ id: uid(), name: r.name, exercises: Array.isArray(r.exercises) ? r.exercises : [] }));
+    next.sets = p.sets
+      .filter(s => Array.isArray(s) && s.length >= 4 && Number.isFinite(+s[2]) && Number.isFinite(+s[3]))
+      .map(s => ({ id: uid(), date: String(s[0]), exercise: String(s[1]), weight: +s[2], reps: +s[3], notes: '', src: 'fitnotes' }));
+    return next;
+  }
+
+  function download(filename, text, type = 'text/csv') {
+    const url = URL.createObjectURL(new Blob([text], { type }));
     const a = document.createElement('a');
     a.href = url; a.download = filename;
     document.body.appendChild(a); a.click(); a.remove();
@@ -474,13 +536,19 @@
       sub: `${cfg.type === 'heavy' ? 'Heavy' : 'Accessory'} · ${num(cfg.increment)}kg steps`,
       back: 'today',
       html: `
+        ${!isWeightExercise(name) ? `
+          <div class="card muted">
+            FitNotes tracked this one by time or distance. LiftLog only records weight × reps, so there's no
+            suggestion for it — log it here as reps if that fits, or keep it in FitNotes.
+          </div>` : ''}
+
         ${shown ? `
           <div class="suggest ${coach ? 'coach' : ''}">
             <div class="eyebrow">${coach ? 'Coach suggests' : 'Suggested next'}</div>
             <div class="big mono">${num(shown.weight)} kg × ${shown.reps}</div>
             <div class="why">${esc(shown.note || '')}${coach && auto ? `<br><span class="muted">Auto-calc said ${num(auto.weight)}kg × ${auto.reps}.</span>` : ''}</div>
           </div>`
-        : '<div class="card muted">First time logging this one — put in what you do and suggestions start from your next session.</div>'}
+        : (isWeightExercise(name) ? '<div class="card muted">First time logging this one — put in what you do and suggestions start from your next session.</div>' : '')}
 
         ${prev ? `
           <div class="card">
@@ -681,10 +749,23 @@
         </div>
 
         <div class="card">
-          <div class="eyebrow">Export</div>
+          <div class="eyebrow">Backup file</div>
           <p class="muted" style="margin:0.45rem 0 0.75rem;line-height:1.5">
-            Downloads your whole log as a FitNotes-format CSV — to feed the Ledger app so the coach can see your
-            training, as a backup, or to move back to FitNotes.
+            A full backup — routines, progression settings and categories included, none of which fit in a CSV.
+            Restoring <strong>replaces everything</strong> currently in the app.
+          </p>
+          <input type="file" id="backup-file" accept=".json,application/json">
+          <div class="row" style="margin-top:0.6rem">
+            <button class="btn ghost" data-act="import-backup">Restore</button>
+            <button class="btn ghost" data-act="export-backup">Download</button>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="eyebrow">Export CSV</div>
+          <p class="muted" style="margin:0.45rem 0 0.75rem;line-height:1.5">
+            Your log in FitNotes' CSV format — to feed the Ledger app so the coach can see your training, or to
+            move back to FitNotes. Note this carries sets only, not routines.
           </p>
           <button class="btn ghost" data-act="export-csv">Download CSV</button>
         </div>
@@ -874,6 +955,34 @@
         if (!state.sets.length) { toast('Nothing to export yet.'); return; }
         download(`liftlog-${ymd()}.csv`, toCsv());
         toast('Exported.');
+        return;
+      }
+      case 'import-backup': {
+        const f = document.getElementById('backup-file').files[0];
+        if (!f) { toast('Choose a backup file first.'); return; }
+        const reader = new FileReader();
+        reader.onload = () => {
+          let next;
+          try {
+            next = fromBackup(String(reader.result || ''));
+          } catch (err) {
+            toast(`Could not read that backup — ${err.message}.`);
+            return;
+          }
+          const summary = `${next.sets.length} sets, ${Object.keys(next.exercises).length} exercises and ${next.routines.length} routines`;
+          if (state.sets.length || state.routines.length) {
+            if (!confirm(`Replace everything in this app with ${summary} from the backup?`)) return;
+          }
+          state = next;
+          if (save()) { go('today'); toast(`Restored ${summary}.`); }
+        };
+        reader.onerror = () => toast('Could not read that file.');
+        reader.readAsText(f);
+        return;
+      }
+      case 'export-backup': {
+        download(`liftlog-backup-${ymd()}.json`, toBackup(), 'application/json');
+        toast('Backup downloaded.');
         return;
       }
       case 'import-coach': {

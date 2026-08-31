@@ -26,27 +26,48 @@ Compound lifts are classified as heavy automatically by name; everything else
 defaults to accessory. Either can be overridden per exercise, along with the
 increment, cadence and rep range, under **Progression settings**.
 
-Suggestions are computed from the limiting set at the top weight of your last
-session, so drop sets and back-off sets don't skew them.
+Suggestions read the top weight of your last session. Heavy lifts keep the rep
+count you actually work at (the most common across those sets), so one short
+set doesn't drag the target down; accessories use the limiting set, because
+double progression should only advance when every set clears the range.
+
+After **more than three weeks** without a given lift, the suggestion switches
+to repeating your last session rather than adding load — coming back from a
+layoff you've detrained, and progressing from where you left off is how people
+get hurt.
 
 ## Setup
 
 1. Open the site and add it to your home screen (Chrome: ⋮ → *Add to home
    screen*). It then runs standalone and works with no connection at all.
-2. In FitNotes: **Settings → Backup → Export**, and put the CSV somewhere you
-   can reach from the phone.
-3. In LiftLog: **Data → Import CSV**. This brings across every exercise, its
-   category, and your full set history.
-4. Rebuild your routines under **Routines** (FitNotes' CSV export contains
-   logged sets only, not routines).
+2. Load your data — either route works:
+   - **From a `.fitnotes` backup** (best): the repo's `tools/fitnotes-to-liftlog.py`
+     converts one into a LiftLog backup file, which carries your exercises,
+     categories, routines, per-exercise increments and full history. Load it
+     under **Data → Backup file → Restore**.
+   - **From a CSV export**: FitNotes → Settings → Backup → Export, then
+     **Data → Import CSV**. Simpler to get hold of, but carries sets only —
+     no routines and no per-exercise increments.
+
+FitNotes routines are a set of named sections, usually the days of a split;
+LiftLog routines are flat, so the converter turns each section into its own
+routine (`Moose · Day 1 - Squat Lower Body`).
+
+FitNotes also tracks duration and distance work — planks, farmers walks,
+cardio. LiftLog only models weight × reps, so those sets aren't carried over.
+The exercises themselves are, since routines reference them, and they say so
+on their own screen instead of offering a meaningless suggestion.
 
 ## Data
 
 Everything lives in this browser on this device — there is no account, no
 server, and nothing is transmitted. That also means clearing site data wipes
-it, so use **Data → Download CSV** now and then. The export is in FitNotes'
-own CSV format, so it round-trips back into FitNotes or into the Ledger
-coaching app.
+it, so export now and then:
+
+- **Data → Backup file → Download** — the complete picture, including routines
+  and progression settings. This is the one to keep.
+- **Data → Download CSV** — sets only, in FitNotes' own format, for feeding the
+  Ledger coaching app or moving back to FitNotes.
 
 ## Coach suggestions
 
@@ -62,6 +83,8 @@ Plain HTML, CSS and JavaScript — no build step and no dependencies.
 - `sw.js` — service worker (app-shell cache; **bump `CACHE` on every deploy**
   or installed copies keep serving the old version)
 - `manifest.webmanifest` — PWA manifest
+- `tools/fitnotes-to-liftlog.py` — converts a `.fitnotes` backup to a LiftLog
+  backup file (standard library only)
 
 To test locally, serve the directory over HTTP (service workers don't run from
 `file://`):
