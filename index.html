@@ -190,6 +190,16 @@
   }
   .plates.warn { color: var(--danger); font-weight: 600; }
 
+  textarea.prose { font-family: inherit; font-size: 0.92rem; min-height: 3.6rem; }
+  .nav button { position: relative; }
+  .nav .dot {
+    position: absolute; top: 0.42rem; left: 50%; margin-left: 0.34rem;
+    width: 0.42rem; height: 0.42rem; border-radius: 999px; background: var(--clay);
+  }
+  .qtext { font-size: 0.95rem; line-height: 1.45; font-weight: 550; }
+  .feel { display: flex; gap: 0.5rem; }
+  .feel .btn { flex: 1; }
+
   .brief { margin-top: 0.4rem; line-height: 1.55; font-size: 0.92rem; }
   .brief p { margin: 0 0 0.7rem; }
   .brief p:last-child { margin-bottom: 0; }
@@ -231,10 +241,17 @@
     goals: [],
     profile: { goals: '', equipment: '', schedule: '', injuries: '' },
     prefs: { increment: 1.25, bar: 20, plates: [20, 15, 10, 5, 2.5, 1.25] },
+    // How the training actually felt — the one thing the log cannot hold, and
+    // the reason the coach can say more than the numbers alone support.
+    // { id, at, kind: 'session' | 'question', sessionId?, questionId?,
+    //   question?, feel?: 'easy'|'right'|'hard', text? }
+    checkins: [],
+    coachSeenAt: null,      // when the Coach tab was last opened; drives the badge
     // Written by the coach, never by the app — see the ownership note in sync().
     coachSuggestions: {},   // name -> { weight, reps, note }
     coachBrief: null,       // { text, at }
     coachProposals: [],     // { id, kind, title, detail, payload }
+    coachQuestions: [],     // { id, text, at, about }
   };
 
   // Sync credentials live under their own key, deliberately outside `state`:
@@ -815,6 +832,9 @@
       // The profile rides along or a restore quietly erases it — including the
       // injuries note, which is the one field nobody can reconstruct.
       profile: state.profile,
+      // Answers you gave once and cannot reconstruct — they belong in the
+      // backup as much as the sets do.
+      checkins: state.checkins,
       coachSuggestions: state.coachSuggestions,
       prefs: state.prefs,
       sets: state.sets,
@@ -842,6 +862,7 @@
     }
     for (const [name, cfg] of Object.entries(p.settings || {})) next.settings[name] = cfg;
     next.coachSuggestions = p.coachSuggestions || {};
+    next.checkins = Array.isArray(p.checkins) ? p.checkins : [];
     next.goals = Array.isArray(p.goals) ? p.goals : [];
     if (p.profile && typeof p.profile === 'object') next.profile = Object.assign(structuredClone(BLANK.profile), p.profile);
     next.sessions = Array.isArray(p.sessions) ? p.sessions : [];
@@ -883,7 +904,7 @@
   // A push therefore carries the remote's own coach block back untouched, so
   // the two can never clobber each other.
   const SYNC_FILE = 'state.json';
-  const APP_FIELDS = ['schemaVersion', 'epoch', 'sets', 'exercises', 'routines', 'sessions', 'settings', 'goals', 'profile', 'prefs'];
+  const APP_FIELDS = ['schemaVersion', 'epoch', 'sets', 'exercises', 'routines', 'sessions', 'settings', 'goals', 'profile', 'prefs', 'checkins'];
 
   function appPayload() {
     const out = {};
@@ -891,13 +912,17 @@
     return out;
   }
   function coachPayload() {
-    return { suggestions: state.coachSuggestions, brief: state.coachBrief, proposals: state.coachProposals };
+    return { suggestions: state.coachSuggestions, brief: state.coachBrief, proposals: state.coachProposals, questions: state.coachQuestions };
   }
   function applyCoach(coach) {
     if (!coach || typeof coach !== 'object') return false;
     state.coachSuggestions = coach.suggestions && typeof coach.suggestions === 'object' ? coach.suggestions : {};
     state.coachBrief = coach.brief || null;
     state.coachProposals = Array.isArray(coach.proposals) ? coach.proposals : [];
+    // A question needs an id to be answerable and text to be readable; without
+    // both there is nothing the app can usefully draw.
+    state.coachQuestions = (Array.isArray(coach.questions) ? coach.questions : [])
+      .filter(q => q && q.id && q.text);
     return true;
   }
   function adoptApp(app) {
@@ -1400,6 +1425,77 @@
     };
   }
 
+  // ------------------------------------------------------- check-ins
+  // The numbers say what was lifted; they cannot say that the last set moved
+  // badly or that the shoulder complained. A check-in is the app asking, and
+  // the coach's questions are the coach asking back — both land in the same
+  // list, which is what it reads next time.
+  const FEELS = [['easy', 'Easy'], ['right', 'About right'], ['hard', 'Hard']];
+
+  function answeredQuestionIds() {
+    return new Set((state.checkins || []).map(c => c.questionId).filter(Boolean));
+  }
+  function openQuestions() {
+    const answered = answeredQuestionIds();
+    return (state.coachQuestions || []).filter(q => !answered.has(q.id));
+  }
+  // What earns the badge on the Coach tab: a question waiting on you, or a
+  // brief written since you last looked.
+  function coachUnread() {
+    const brief = state.coachBrief;
+    const fresh = brief && brief.at && (!state.coachSeenAt || brief.at > state.coachSeenAt);
+    return openQuestions().length + (fresh ? 1 : 0);
+  }
+  function recentCheckins(n = 6) {
+    return [...(state.checkins || [])].sort((a, b) => String(b.at).localeCompare(String(a.at))).slice(0, n);
+  }
+  function checkinLine(c) {
+    const feel = c.feel ? (FEELS.find(([k]) => k === c.feel) || [, c.feel])[1] : '';
+    const head = c.kind === 'question' ? (c.question || 'Coach question') : `${c.sessionName || 'Session'}${feel ? ` — ${feel}` : ''}`;
+    return { head, body: c.text || '', when: c.at ? fmtDate(String(c.at).slice(0, 10)) : '' };
+  }
+
+  // Shown once, straight after Complete, while the session is still in the
+  // body. Skipping is a first-class outcome — a prompt you cannot dismiss is a
+  // prompt you learn to lie to.
+  function debriefView(sessionId) {
+    const session = state.sessions.find(x => x.id === sessionId);
+    if (!session) return todayView();
+    const logged = state.sets.filter(x => x.sessionId === sessionId).length;
+    const open = openQuestions();
+
+    return {
+      title: 'How did that go?',
+      sub: `${session.name} — ${logged} set${logged === 1 ? '' : 's'}`,
+      html: `
+        <div class="card">
+          <div class="eyebrow">Effort</div>
+          <div class="feel" style="margin-top:0.5rem">
+            ${FEELS.map(([k, label]) => `
+              <button class="btn small ${view.feel === k ? '' : 'ghost'}" data-act="debrief-feel" data-feel="${k}">${label}</button>`).join('')}
+          </div>
+          <div style="margin-top:0.8rem">
+            <label class="field-label" for="debrief-note">Anything worth saying?</label>
+            <textarea class="prose" id="debrief-note" placeholder="Left shoulder pinched on the last press set…">${esc(view.note || '')}</textarea>
+          </div>
+          <div class="row" style="margin-top:0.75rem">
+            <button class="btn" data-act="save-debrief" data-id="${esc(sessionId)}">Save</button>
+            <button class="btn ghost" data-act="skip-debrief">Skip</button>
+          </div>
+        </div>
+
+        ${open.length ? `<div class="card" style="margin-top:0.7rem">
+          <div class="eyebrow">Your coach is asking</div>
+          <p class="muted" style="margin:0.4rem 0 0.7rem;line-height:1.5">
+            ${open.length} question${open.length === 1 ? '' : 's'} waiting — answering ${open.length === 1 ? 'it' : 'them'} is what
+            makes the next assessment worth reading.
+          </p>
+          <button class="btn ghost" data-go="coach">Open the Coach tab</button>
+        </div>` : ''}
+      `,
+    };
+  }
+
   // What the coach has said, and anything it wants to change. Structural
   // changes arrive as proposals rather than edits — an agent quietly rewriting
   // a 16-week programme is not something to discover mid-session.
@@ -1407,6 +1503,8 @@
     const brief = state.coachBrief;
     const props = state.coachProposals || [];
     const sugg = Object.entries(state.coachSuggestions || {});
+    const open = openQuestions();
+    const log = recentCheckins();
 
     return {
       title: 'Coach',
@@ -1419,6 +1517,22 @@
             <strong>Data → Sync</strong>, then ask it to take a look.
           </p>
           <button class="btn ghost" data-go="data">Open sync settings</button>
+        </div>` : ''}
+
+        ${open.length ? `<div class="card">
+          <div class="eyebrow">Asking you</div>
+          <p class="muted" style="margin:0.4rem 0 0.8rem">Answers go back with your next sync.</p>
+          <div class="list-stack">
+            ${open.map(q => `
+              <div class="card" style="padding:0.75rem 0.85rem">
+                <div class="qtext">${esc(q.text)}</div>
+                ${q.about ? `<div class="muted" style="margin-top:0.2rem">About ${esc(q.about)}</div>` : ''}
+                <textarea class="prose" id="q-${esc(q.id)}" style="margin-top:0.5rem" placeholder="Your answer…"></textarea>
+                <div style="margin-top:0.5rem">
+                  <button class="btn small" data-act="answer-question" data-id="${esc(q.id)}">Answer</button>
+                </div>
+              </div>`).join('')}
+          </div>
         </div>` : ''}
 
         ${brief ? `<div class="card">
@@ -1454,6 +1568,17 @@
               <div class="mono" style="font-weight:650">${esc(setLabel(s, kindOf(name), true))}</div>
             </div>`).join('')}
           <div style="margin-top:0.7rem"><button class="btn small ghost" data-act="clear-coach">Clear these</button></div>
+        </div>` : ''}
+
+        ${log.length ? `<div class="card">
+          <div class="eyebrow">Your check-ins</div>
+          <p class="muted" style="margin:0.4rem 0 0.6rem">What the coach reads alongside the numbers.</p>
+          ${log.map(c => { const l = checkinLine(c); return `
+            <div class="set-row">
+              <div class="v"><div class="name" style="font-size:0.92rem">${esc(l.head)}</div>
+                ${l.body ? `<div class="meta muted">${esc(l.body)}</div>` : ''}</div>
+              <div class="muted" style="flex:none">${esc(l.when)}</div>
+            </div>`; }).join('')}
         </div>` : ''}
       `,
     };
@@ -1609,7 +1734,17 @@
       case 'history': return historyView();
       case 'routines': return routinesView();
       case 'workout': return workoutView(view.id);
-      case 'coach': return coachView();
+      case 'debrief': return debriefView(view.id);
+      case 'coach': {
+        // Opening the tab is what clears the badge — done here rather than in
+        // render() so it happens once, before the nav is drawn.
+        const brief = state.coachBrief;
+        if (brief && brief.at && (!state.coachSeenAt || brief.at > state.coachSeenAt)) {
+          state.coachSeenAt = new Date().toISOString();
+          save();
+        }
+        return coachView();
+      }
       case 'profile': return profileView();
       case 'data': return dataView();
       default: return todayView();
@@ -1626,8 +1761,11 @@
       </div>
       <main>${v.html}</main>
       <nav class="nav">
-        ${NAV.map(n => `<button data-go="${n.id}" aria-current="${navActive === n.id}">
-          <span class="ic">${n.ic}</span><span>${n.label}</span></button>`).join('')}
+        ${NAV.map(n => {
+          const badge = n.id === 'coach' && coachUnread() > 0;
+          return `<button data-go="${n.id}" aria-current="${navActive === n.id}"${badge ? ' aria-label="Coach, new"' : ''}>
+          <span class="ic">${n.ic}</span>${badge ? '<span class="dot"></span>' : ''}<span>${n.label}</span></button>`;
+        }).join('')}
       </nav>`;
     wire();
   }
@@ -1919,7 +2057,7 @@
         session.endedAt = new Date().toISOString();
         if (!session.startedAt) session.startedAt = session.endedAt;
         state.active = null;
-        save(); go('today');
+        save(); go('debrief', { id: session.id });
         toast(`Workout complete — ${logged} set${logged === 1 ? '' : 's'}.`);
         return;
       }
@@ -2130,6 +2268,45 @@
         } catch {
           toast('That is not valid JSON.');
         }
+        return;
+      }
+      // Selecting an effort re-renders, so carry whatever has been typed
+      // across with it rather than throwing the note away.
+      case 'debrief-feel': {
+        const note = document.getElementById('debrief-note');
+        view.note = note ? note.value : (view.note || '');
+        view.feel = view.feel === data.feel ? null : data.feel;
+        render();
+        return;
+      }
+      case 'save-debrief': {
+        const session = state.sessions.find(x => x.id === data.id);
+        const text = (document.getElementById('debrief-note').value || '').trim();
+        if (!view.feel && !text) { go('today'); return; }
+        state.checkins.push({
+          id: uid(), at: new Date().toISOString(), kind: 'session',
+          sessionId: data.id, sessionName: session ? session.name : '',
+          ...(view.feel ? { feel: view.feel } : {}),
+          ...(text ? { text } : {}),
+        });
+        save(); go('today'); toast('Noted — the coach will see it.');
+        return;
+      }
+      case 'skip-debrief': {
+        go('today');
+        return;
+      }
+      case 'answer-question': {
+        const q = (state.coachQuestions || []).find(x => x.id === data.id);
+        const box = document.getElementById(`q-${data.id}`);
+        const text = box ? box.value.trim() : '';
+        if (!q) return;
+        if (!text) { toast('Write an answer first.'); return; }
+        state.checkins.push({
+          id: uid(), at: new Date().toISOString(), kind: 'question',
+          questionId: q.id, question: q.text, text,
+        });
+        save(); render(); toast('Answered.');
         return;
       }
       case 'clear-coach': {

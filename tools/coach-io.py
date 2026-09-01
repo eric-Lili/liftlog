@@ -6,7 +6,7 @@
 `read` fetches the shared state and prints a summary; with --out it also saves
 the whole document for inspection.
 
-`write` replaces ONLY the `coach` block. The app owns everything under `app`
+`write` replaces ONLY the `coach` block (brief, suggestions, proposals, questions). The app owns everything under `app`
 and this script will not touch it — that separation is what stops the phone and
 the coach clobbering each other, so it is enforced here rather than trusted.
 
@@ -49,9 +49,34 @@ def summarise(doc):
     if any(prof.values()):
         print("profile: " + "; ".join(f"{k}={v}" for k, v in prof.items() if v))
     coach = doc.get("coach") or {}
+    questions = coach.get("questions") or []
     print(f"coach: {len(coach.get('suggestions') or {})} suggestions, "
           f"{len(coach.get('proposals') or [])} proposals, "
+          f"{len(questions)} questions, "
           f"brief {'yes' if coach.get('brief') else 'no'}")
+
+    # The check-ins are the half of the picture the sets cannot carry, so they
+    # go in the summary rather than being left for whoever thinks to open the
+    # file. An unanswered question is one you already asked — asking it again
+    # is how a coach stops being listened to.
+    checkins = app.get("checkins") or []
+    answered = {c.get("questionId") for c in checkins if c.get("questionId")}
+    unanswered = [q for q in questions if q.get("id") not in answered]
+    if unanswered:
+        print(f"\nstill unanswered ({len(unanswered)}):")
+        for q in unanswered:
+            print(f"  [{q.get('id')}] {q.get('text', '')}")
+    recent = sorted(checkins, key=lambda c: str(c.get("at", "")), reverse=True)[:12]
+    if recent:
+        print(f"\n{len(checkins)} check-ins, most recent first:")
+        for c in recent:
+            when = str(c.get("at", ""))[:10]
+            if c.get("kind") == "question":
+                print(f"  {when}  Q: {c.get('question', '')}")
+                print(f"              A: {c.get('text', '')}")
+            else:
+                bits = [b for b in (c.get("sessionName"), c.get("feel"), c.get("text")) if b]
+                print(f"  {when}  " + " — ".join(bits))
 
 
 def main():
@@ -81,9 +106,19 @@ def main():
         coach = json.load(fh)
     if not isinstance(coach, dict):
         sys.exit("the coach block must be a JSON object")
-    unknown = set(coach) - {"brief", "suggestions", "proposals"}
+    unknown = set(coach) - {"brief", "suggestions", "proposals", "questions"}
     if unknown:
         sys.exit(f"unexpected keys in the coach block: {sorted(unknown)}")
+
+    # A question the app cannot draw or cannot file an answer against is worse
+    # than no question, so it is rejected here rather than silently dropped on
+    # the phone.
+    for q in coach.get("questions") or []:
+        if not isinstance(q, dict) or not q.get("id") or not q.get("text"):
+            sys.exit(f"every question needs an id and text: {q!r}")
+    ids = [q["id"] for q in coach.get("questions") or []]
+    if len(ids) != len(set(ids)):
+        sys.exit("question ids must be unique")
 
     # Re-read immediately before writing to narrow the race, and only ever
     # replace `coach`.

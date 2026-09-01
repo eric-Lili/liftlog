@@ -1,0 +1,13 @@
+[Unit]
+Description=LiftLog weekly coach review
+
+[Timer]
+# Sunday evening: the training week is done and there is time to read it.
+# An off-minute on purpose — see tools/weekly-review.sh.
+OnCalendar=Sun 18:47
+# Catch up after a week the machine was off rather than skipping it silently.
+Persistent=true
+RandomizedDelaySec=5min
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,11 @@
+[Unit]
+Description=LiftLog weekly coach review
+Documentation=https://github.com/eric-Lili/liftlog
+After=graphical-session.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/Projects/liftlog/tools/weekly-review.sh
+# The coach talks to GitHub and to the API, so a stuck run should not sit
+# holding the slot until next Sunday.
+TimeoutStartSec=15min

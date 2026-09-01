@@ -144,11 +144,16 @@ Ownership is structural rather than by agreement:
 
 ```
 state.json
-  app     sets, exercises, routines, sessions, settings, goals, profile, prefs
+  app     sets, exercises, routines, sessions, settings, goals, profile,
+          prefs, checkins
           — written only by LiftLog
-  coach   brief, suggestions, proposals
+  coach   brief, suggestions, proposals, questions
           — written only by the coach
 ```
+
+Note which side owns the check-ins: the coach *asks* (`coach.questions`) but
+the app *records* (`app.checkins`). An answer is something you said, so it sits
+with the rest of your data and survives the coach rewriting its block.
 
 A push carries the remote's own `coach` block back untouched, so neither side
 can clobber the other. An `epoch` counter settles the rest: it increments on any
@@ -176,6 +181,56 @@ workout. Proposals are applied by the app from a fixed vocabulary only when you
 accept them; an unrecognised one is inert. Nothing the agent writes changes your
 programme on its own.
 
+### Check-ins
+
+The log knows what you lifted. It cannot know that the last set moved badly, or
+that the shoulder complained, or that you slept four hours — and that is
+precisely the context a coach reasons from. So the conversation runs both ways.
+
+**After you tap Complete**, the app asks one question: how did that go? Easy,
+about right, or hard, plus a note if there is one. It takes a couple of seconds
+and skipping is a real option — a prompt you cannot dismiss is a prompt you
+learn to lie to.
+
+**The coach asks back.** It can write questions into `coach.questions`, which
+appear as an answerable card at the top of the Coach tab and are nudged once
+after a session. They are meant to be few and specific: it is told to ask at
+most two or three, never to ask what the log already answers, to carry
+unanswered ones forward unchanged, and to drop a question the moment it has been
+answered. Your answers land in `app.checkins` and stay there.
+
+The Coach tab carries a dot when a question is waiting or a brief has been
+written since you last looked.
+
+### The weekly review
+
+A systemd user timer runs the coach every Sunday evening, whether or not you
+think to ask it:
+
+```
+tools/weekly-review.sh          the run itself — a headless `claude -p` session
+tools/liftlog-review.service    what runs it
+tools/liftlog-review.timer      when (Sun 18:47, catching up a missed week)
+```
+
+Install by symlinking the two units into `~/.config/systemd/user/`, then:
+
+```
+systemctl --user daemon-reload
+systemctl --user enable --now liftlog-review.timer
+systemctl --user list-timers liftlog-review.timer   # confirm it is armed
+journalctl --user -u liftlog-review -n 50           # read the last run
+```
+
+The session runs as the `workout-coach` agent with only `Read` and
+`Bash(python3:*)` allowed — enough to run `coach-io.py` and nothing else. It
+ends by printing a one-line summary, which the script turns into a desktop
+notification. **A week with nothing to say sends no notification**: the coach is
+told to write nothing when nothing has been logged since its last brief, and a
+weekly "no news" is how notifications get switched off.
+
+To stop it: `systemctl --user disable --now liftlog-review.timer`.
+
 ## Development
 
 Plain HTML, CSS and JavaScript — no build step and no dependencies.
@@ -188,6 +243,8 @@ Plain HTML, CSS and JavaScript — no build step and no dependencies.
   backup file (standard library only)
 - `tools/coach-io.py` — reads the synced state and writes back the coach block,
   refusing to touch anything the app owns
+- `tools/weekly-review.sh` + `tools/liftlog-review.{service,timer}` — the
+  scheduled weekly coach run and its systemd user timer
 
 To test locally, serve the directory over HTTP (service workers don't run from
 `file://`):
