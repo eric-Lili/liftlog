@@ -812,6 +812,9 @@
       routines: state.routines,
       sessions: state.sessions,
       goals: state.goals,
+      // The profile rides along or a restore quietly erases it — including the
+      // injuries note, which is the one field nobody can reconstruct.
+      profile: state.profile,
       coachSuggestions: state.coachSuggestions,
       prefs: state.prefs,
       sets: state.sets,
@@ -840,6 +843,7 @@
     for (const [name, cfg] of Object.entries(p.settings || {})) next.settings[name] = cfg;
     next.coachSuggestions = p.coachSuggestions || {};
     next.goals = Array.isArray(p.goals) ? p.goals : [];
+    if (p.profile && typeof p.profile === 'object') next.profile = Object.assign(structuredClone(BLANK.profile), p.profile);
     next.sessions = Array.isArray(p.sessions) ? p.sessions : [];
 
     next.routines = (p.routines || []).filter(r => r && r.name).map(r => (

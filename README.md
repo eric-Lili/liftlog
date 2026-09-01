@@ -128,8 +128,8 @@ Everything lives in this browser on this device — there is no account, no
 server, and nothing is transmitted. That also means clearing site data wipes
 it, so export now and then:
 
-- **Data → Backup file → Download** — the complete picture, including routines
-  and progression settings. This is the one to keep.
+- **Data → Backup file → Download** — the complete picture, including routines,
+  progression settings and your profile. This is the one to keep.
 - **Data → Download CSV** — sets only, in FitNotes' own columns (including
   `Distance`, `Distance Unit` and `Time`), for feeding the Ledger coaching app
   or moving back to FitNotes.
