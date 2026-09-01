@@ -161,7 +161,7 @@ state.json
   app     sets, exercises, routines, sessions, settings, goals, profile,
           prefs, checkins, proposalsDone
           — written only by LiftLog
-  coach   brief, suggestions, proposals, questions
+  coach   brief, suggestions, proposals, questions, checkins
           — written only by the coach
 ```
 
@@ -206,10 +206,38 @@ The log knows what you lifted. It cannot know that the last set moved badly, or
 that the shoulder complained, or that you slept four hours — and that is
 precisely the context a coach reasons from. So the conversation runs both ways.
 
-**After you tap Complete**, the app asks one question: how did that go? Easy,
-about right, or hard, plus a note if there is one. It takes a couple of seconds
-and skipping is a real option — a prompt you cannot dismiss is a prompt you
-learn to lie to.
+**After you tap Complete**, the app asks one question. Sometimes it is its own —
+easy, about right, or hard, plus a note — and sometimes it is one the coach
+staged for you. It takes a couple of seconds and skipping is a real option: a
+prompt you cannot dismiss is a prompt you learn to lie to.
+
+### The staged bank
+
+The coach runs from a timer on a desktop, so it cannot be asked anything while
+you are at the gym. Instead it writes a bank of check-ins ahead of time, each
+with a rule saying when it applies, and the app picks one offline:
+
+```
+coach.checkins
+  { id, text, options?, note?, scope?, when? }
+
+  when: { exercise: "Deadlift" }   a session that included that lift
+        { idleDays: 8 }            the first session back after 8 days off
+        omitted                    generic — any session
+
+  scope: "session"   after Complete (default)
+         "exercise"  on that exercise's screen, once a set is logged
+```
+
+The most specific unused match wins — exercise beats idle beats generic — and
+among equals the app rotates, taking turns with its own built-in card so the
+same question never becomes wallpaper. An entry is spent once answered, and the
+app always falls back to its own check-in when the bank is empty, so it works
+whether or not the coach has ever run.
+
+This is deliberately not the same thing as `coach.questions`: a question waits
+in the Coach tab until you answer it, a staged check-in fires once, in context,
+and is gone.
 
 **The coach asks back.** It can write questions into `coach.questions`, which
 appear as an answerable card at the top of the Coach tab and are nudged once

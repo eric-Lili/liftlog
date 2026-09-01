@@ -6,7 +6,8 @@
 `read` fetches the shared state and prints a summary; with --out it also saves
 the whole document for inspection.
 
-`write` replaces ONLY the `coach` block (brief, suggestions, proposals, questions). The app owns everything under `app`
+`write` replaces ONLY the `coach` block (brief, suggestions, proposals,
+questions, checkins). The app owns everything under `app`
 and this script will not touch it — that separation is what stops the phone and
 the coach clobbering each other, so it is enforced here rather than trusted.
 
@@ -50,9 +51,10 @@ def summarise(doc):
         print("profile: " + "; ".join(f"{k}={v}" for k, v in prof.items() if v))
     coach = doc.get("coach") or {}
     questions = coach.get("questions") or []
+    bank = coach.get("checkins") or []
     print(f"coach: {len(coach.get('suggestions') or {})} suggestions, "
           f"{len(coach.get('proposals') or [])} proposals, "
-          f"{len(questions)} questions, "
+          f"{len(questions)} questions, {len(bank)} staged check-ins, "
           f"brief {'yes' if coach.get('brief') else 'no'}")
 
     # The check-ins are the half of the picture the sets cannot carry, so they
@@ -66,6 +68,18 @@ def summarise(doc):
         print(f"\nstill unanswered ({len(unanswered)}):")
         for q in unanswered:
             print(f"  [{q.get('id')}] {q.get('text', '')}")
+    used = {c.get("bankId") for c in checkins if c.get("bankId")}
+    unused = [c for c in bank if c.get("id") not in used]
+    if bank:
+        print(f"\nstaged bank: {len(unused)} of {len(bank)} still unused")
+        for c in bank:
+            when = c.get("when") or {}
+            rule = (f"after {when['exercise']}" if when.get("exercise")
+                    else f"if {when['idleDays']}+ days idle" if when.get("idleDays")
+                    else "any session")
+            mark = " " if c.get("id") in used else "*"
+            print(f"  {mark} [{c.get('id')}] ({c.get('scope', 'session')}, {rule}) {c.get('text', '')}")
+
     recent = sorted(checkins, key=lambda c: str(c.get("at", "")), reverse=True)[:12]
     if recent:
         print(f"\n{len(checkins)} check-ins, most recent first:")
@@ -75,8 +89,62 @@ def summarise(doc):
                 print(f"  {when}  Q: {c.get('question', '')}")
                 print(f"              A: {c.get('text', '')}")
             else:
-                bits = [b for b in (c.get("sessionName"), c.get("feel"), c.get("text")) if b]
+                where = c.get("exercise") or c.get("sessionName")
+                bits = [b for b in (where, c.get("choice") or c.get("feel")) if b]
                 print(f"  {when}  " + " — ".join(bits))
+                if c.get("bankId"):
+                    print(f"              asked: {c.get('question', '')}")
+                if c.get("text"):
+                    print(f"              said:  {c['text']}")
+
+
+def fail(msg):
+    raise ValueError(msg)
+
+
+def validate_coach(coach):
+    """Reject anything the app could not draw. Raises ValueError."""
+    if not isinstance(coach, dict):
+        fail("the coach block must be a JSON object")
+    unknown = set(coach) - {"brief", "suggestions", "proposals", "questions", "checkins"}
+    if unknown:
+        fail(f"unexpected keys in the coach block: {sorted(unknown)}")
+
+    # A question the app cannot draw or cannot file an answer against is worse
+    # than no question, so it is rejected here rather than silently dropped on
+    # the phone.
+    for q in coach.get("questions") or []:
+        if not isinstance(q, dict) or not q.get("id") or not q.get("text"):
+            fail(f"every question needs an id and text: {q!r}")
+    ids = [q["id"] for q in coach.get("questions") or []]
+    if len(ids) != len(set(ids)):
+        fail("question ids must be unique")
+
+    # The staged bank. The phone reads these with no way to ask about anything
+    # it does not understand, so a malformed entry is rejected here rather than
+    # silently dropped at the gym.
+    seen = set()
+    for c in coach.get("checkins") or []:
+        if not isinstance(c, dict) or not c.get("id") or not c.get("text"):
+            fail(f"every staged check-in needs an id and text: {c!r}")
+        if c["id"] in seen:
+            fail(f"duplicate staged check-in id: {c['id']}")
+        seen.add(c["id"])
+        if c["id"] == "built-in":
+            fail("'built-in' is the app's own check-in id — pick another")
+        if c.get("scope", "session") not in ("session", "exercise"):
+            fail(f"scope must be 'session' or 'exercise': {c['id']}")
+        opts = c.get("options")
+        if opts is not None and (not isinstance(opts, list) or not all(isinstance(o, str) for o in opts)):
+            fail(f"options must be a list of strings: {c['id']}")
+        when = c.get("when") or {}
+        if not isinstance(when, dict) or set(when) - {"exercise", "idleDays"}:
+            fail(f"when may only hold 'exercise' and/or 'idleDays': {c['id']}")
+        if "idleDays" in when and not isinstance(when["idleDays"], int):
+            fail(f"when.idleDays must be a whole number of days: {c['id']}")
+        if c.get("scope") == "exercise" and not when.get("exercise"):
+            fail(f"an exercise-scope check-in needs when.exercise: {c['id']}")
+
 
 
 def main():
@@ -104,21 +172,10 @@ def main():
         sys.exit("write needs --coach pointing at a JSON file")
     with open(a.coach, encoding="utf-8") as fh:
         coach = json.load(fh)
-    if not isinstance(coach, dict):
-        sys.exit("the coach block must be a JSON object")
-    unknown = set(coach) - {"brief", "suggestions", "proposals", "questions"}
-    if unknown:
-        sys.exit(f"unexpected keys in the coach block: {sorted(unknown)}")
-
-    # A question the app cannot draw or cannot file an answer against is worse
-    # than no question, so it is rejected here rather than silently dropped on
-    # the phone.
-    for q in coach.get("questions") or []:
-        if not isinstance(q, dict) or not q.get("id") or not q.get("text"):
-            sys.exit(f"every question needs an id and text: {q!r}")
-    ids = [q["id"] for q in coach.get("questions") or []]
-    if len(ids) != len(set(ids)):
-        sys.exit("question ids must be unique")
+    try:
+        validate_coach(coach)
+    except ValueError as err:
+        sys.exit(str(err))
 
     # Re-read immediately before writing to narrow the race, and only ever
     # replace `coach`.

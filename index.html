@@ -201,8 +201,10 @@
     width: 0.42rem; height: 0.42rem; border-radius: 999px; background: var(--clay);
   }
   .qtext { font-size: 0.95rem; line-height: 1.45; font-weight: 550; }
-  .feel { display: flex; gap: 0.5rem; }
-  .feel .btn { flex: 1; }
+  .feel { display: flex; gap: 0.5rem; flex-wrap: wrap; }
+  .feel .btn { flex: 1 1 6rem; }
+  .card.asks { border-color: var(--iris); }
+  .card.asks .eyebrow { color: var(--iris); }
 
   .brief { margin-top: 0.4rem; line-height: 1.55; font-size: 0.92rem; }
   .brief p { margin: 0 0 0.7rem; }
@@ -271,6 +273,10 @@
     coachBrief: null,       // { text, at }
     coachProposals: [],     // { id, kind, title, detail, payload }
     coachQuestions: [],     // { id, text, at, about }
+    // The staged bank. The coach only runs on the desktop, so it cannot be
+    // asked anything at the gym — it writes these ahead of time and the app
+    // picks whichever fits, offline.
+    coachCheckins: [],      // { id, text, scope, when, options, note, at }
   };
 
   // Sync credentials live under their own key, deliberately outside `state`:
@@ -964,6 +970,8 @@
       .filter(q => q && q.id && q.text);
     // Once the coach stops offering a proposal there is nothing left to
     // suppress, so drop it rather than growing this list forever.
+    state.coachCheckins = (Array.isArray(coach.checkins) ? coach.checkins : [])
+      .filter(c => c && c.id && c.text);
     const live = new Set(state.coachProposals.map(x => x.id));
     state.proposalsDone = (state.proposalsDone || []).filter(id => live.has(id));
     return true;
@@ -1181,6 +1189,12 @@
       </div>`;
     };
 
+    // Only once you have actually logged something — asking how a set felt
+    // before you have done one is noise.
+    const exCheck = todaySets.length && !view.exSkip
+      ? pickCheckin({ exercises: [name], date: today, scope: 'exercise' })
+      : null;
+
     return {
       title: name,
       sub: kind === 'weight'
@@ -1219,6 +1233,22 @@
               <button class="x" data-act="del-set" data-id="${s.id}" aria-label="Delete set">×</button>
             </div>`).join('') : '<div class="muted" style="padding:0.4rem 0">No sets yet.</div>'}
         </div>
+
+        ${exCheck ? `<div class="card asks">
+          <div class="eyebrow">Your coach asks</div>
+          <div class="qtext" style="margin-top:0.35rem">${esc(exCheck.text)}</div>
+          ${(exCheck.options || []).length ? `<div class="feel" style="margin-top:0.6rem">
+            ${exCheck.options.map(o => `
+              <button class="btn small ${view.exChoice === o ? '' : 'ghost'}" data-act="ex-choice" data-choice="${esc(o)}" data-exercise="${esc(name)}">${esc(o)}</button>`).join('')}
+          </div>` : ''}
+          ${exCheck.note === false ? '' : `<div style="margin-top:0.7rem">
+            <textarea class="prose" id="ex-note" placeholder="${esc(exCheck.note || 'Your answer…')}">${esc(view.exNote || '')}</textarea>
+          </div>`}
+          <div class="row" style="margin-top:0.6rem">
+            <button class="btn small" data-act="save-excheckin" data-exercise="${esc(name)}">Answer</button>
+            <button class="btn small ghost" data-act="skip-excheckin" data-exercise="${esc(name)}">Not now</button>
+          </div>
+        </div>` : ''}
 
         <button class="btn ghost" data-go="exsettings" data-exercise="${esc(name)}">${kind === 'weight' ? 'Progression settings' : 'Exercise settings'}</button>
       `,
@@ -1473,7 +1503,55 @@
   // badly or that the shoulder complained. A check-in is the app asking, and
   // the coach's questions are the coach asking back — both land in the same
   // list, which is what it reads next time.
-  const FEELS = [['easy', 'Easy'], ['right', 'About right'], ['hard', 'Hard']];
+  // The app's own check-in. The bank can be empty — the coach may never have
+  // run — so there is always something to ask without it.
+  const DEFAULT_CHECKIN = {
+    id: 'built-in',
+    text: 'How did that go?',
+    options: ['Easy', 'About right', 'Hard'],
+    note: 'Anything worth saying?',
+  };
+  const LEGACY_FEEL = { easy: 'Easy', right: 'About right', hard: 'Hard' };
+
+  function daysBetween(a, b) {
+    return Math.round((new Date(b + 'T00:00:00') - new Date(a + 'T00:00:00')) / 86400000);
+  }
+  // Days off before the given training day — what an `idleDays` rule measures.
+  function idleBefore(date) {
+    const before = [...new Set(state.sets.map(s => s.date))].filter(d => d < date).sort();
+    return before.length ? daysBetween(before[before.length - 1], date) : 0;
+  }
+  function usedBankIds() {
+    return new Set((state.checkins || []).map(c => c.bankId).filter(Boolean));
+  }
+
+  // Which staged check-in fits this moment. Specificity wins: a question about
+  // an exercise you just did beats one about a layoff, which beats a generic
+  // one. Among equals it rotates — the same card every session becomes
+  // wallpaper, and wallpaper gets tapped through without being read.
+  function pickCheckin({ exercises = [], date = ymd(), scope = 'session' } = {}) {
+    const used = usedBankIds();
+    const idle = idleBefore(date);
+    const ranked = [];
+    for (const c of state.coachCheckins || []) {
+      if (used.has(c.id) || (c.scope || 'session') !== scope) continue;
+      const when = c.when || {};
+      if (when.exercise) {
+        if (exercises.includes(when.exercise)) ranked.push([3, c]);
+      } else if (when.idleDays) {
+        if (idle >= when.idleDays) ranked.push([2, c]);
+      } else {
+        ranked.push([1, c]);
+      }
+    }
+    if (!ranked.length) return scope === 'session' ? DEFAULT_CHECKIN : null;
+    const top = Math.max(...ranked.map(([r]) => r));
+    const pool = ranked.filter(([r]) => r === top).map(([, c]) => c);
+    // A generic bank card and the built-in take turns rather than one of them
+    // always winning.
+    if (top === 1 && scope === 'session') pool.push(DEFAULT_CHECKIN);
+    return pool[(state.checkins || []).length % pool.length];
+  }
 
   function answeredQuestionIds() {
     return new Set((state.checkins || []).map(c => c.questionId).filter(Boolean));
@@ -1493,34 +1571,54 @@
     return [...(state.checkins || [])].sort((a, b) => String(b.at).localeCompare(String(a.at))).slice(0, n);
   }
   function checkinLine(c) {
-    const feel = c.feel ? (FEELS.find(([k]) => k === c.feel) || [, c.feel])[1] : '';
-    const head = c.kind === 'question' ? (c.question || 'Coach question') : `${c.sessionName || 'Session'}${feel ? ` — ${feel}` : ''}`;
-    return { head, body: c.text || '', when: c.at ? fmtDate(String(c.at).slice(0, 10)) : '' };
+    const pick = c.choice || (c.feel ? (LEGACY_FEEL[c.feel] || c.feel) : '');
+    let head;
+    if (c.kind === 'question') head = c.question || 'Coach question';
+    else if (c.kind === 'exercise') head = `${c.exercise || 'Exercise'}${pick ? ` — ${pick}` : ''}`;
+    else head = `${c.sessionName || 'Session'}${pick ? ` — ${pick}` : ''}`;
+    // A staged question is worth showing back; the built-in one never is.
+    const asked = c.kind !== 'question' && c.bankId ? c.question : '';
+    return { head, asked, body: c.text || '', when: c.at ? fmtDate(String(c.at).slice(0, 10)) : '' };
   }
 
   // Shown once, straight after Complete, while the session is still in the
   // body. Skipping is a first-class outcome — a prompt you cannot dismiss is a
   // prompt you learn to lie to.
+  // What the debrief is asking about — recomputed rather than remembered,
+  // because nothing it depends on changes between drawing the card and saving
+  // the answer.
+  function debriefCheckin(session) {
+    const sets = state.sets.filter(x => x.sessionId === session.id);
+    return pickCheckin({
+      exercises: [...new Set(sets.map(x => x.exercise))],
+      date: session.date,
+      scope: 'session',
+    });
+  }
+
   function debriefView(sessionId) {
     const session = state.sessions.find(x => x.id === sessionId);
     if (!session) return todayView();
     const logged = state.sets.filter(x => x.sessionId === sessionId).length;
     const open = openQuestions();
+    const ci = debriefCheckin(session);
+    const staged = ci.id !== DEFAULT_CHECKIN.id;
 
     return {
-      title: 'How did that go?',
+      title: staged ? 'Your coach asks' : 'How did that go?',
       sub: `${session.name} — ${logged} set${logged === 1 ? '' : 's'}`,
       html: `
-        <div class="card">
-          <div class="eyebrow">Effort</div>
-          <div class="feel" style="margin-top:0.5rem">
-            ${FEELS.map(([k, label]) => `
-              <button class="btn small ${view.feel === k ? '' : 'ghost'}" data-act="debrief-feel" data-feel="${k}">${label}</button>`).join('')}
-          </div>
-          <div style="margin-top:0.8rem">
-            <label class="field-label" for="debrief-note">Anything worth saying?</label>
-            <textarea class="prose" id="debrief-note" placeholder="Left shoulder pinched on the last press set…">${esc(view.note || '')}</textarea>
-          </div>
+        <div class="card${staged ? ' asks' : ''}">
+          <div class="eyebrow">${staged ? (ci.when && ci.when.exercise ? esc(ci.when.exercise) : 'From your coach') : 'Effort'}</div>
+          ${staged ? `<div class="qtext" style="margin-top:0.35rem">${esc(ci.text)}</div>` : ''}
+          ${(ci.options || []).length ? `<div class="feel" style="margin-top:0.6rem">
+            ${ci.options.map(o => `
+              <button class="btn small ${view.choice === o ? '' : 'ghost'}" data-act="debrief-choice" data-choice="${esc(o)}">${esc(o)}</button>`).join('')}
+          </div>` : ''}
+          ${ci.note === false ? '' : `<div style="margin-top:0.8rem">
+            <label class="field-label" for="debrief-note">${esc(ci.note || 'Anything worth saying?')}</label>
+            <textarea class="prose" id="debrief-note" placeholder="Anything the numbers won’t show…">${esc(view.note || '')}</textarea>
+          </div>`}
           <div class="row" style="margin-top:0.75rem">
             <button class="btn" data-act="save-debrief" data-id="${esc(sessionId)}">Save</button>
             <button class="btn ghost" data-act="skip-debrief">Skip</button>
@@ -1619,6 +1717,7 @@
           ${log.map(c => { const l = checkinLine(c); return `
             <div class="set-row">
               <div class="v"><div class="name" style="font-size:0.92rem">${esc(l.head)}</div>
+                ${l.asked ? `<div class="meta muted" style="font-style:italic">${esc(l.asked)}</div>` : ''}
                 ${l.body ? `<div class="meta muted">${esc(l.body)}</div>` : ''}</div>
               <div class="muted" style="flex:none">${esc(l.when)}</div>
             </div>`; }).join('')}
@@ -2321,21 +2420,28 @@
       }
       // Selecting an effort re-renders, so carry whatever has been typed
       // across with it rather than throwing the note away.
-      case 'debrief-feel': {
+      case 'debrief-choice': {
         const note = document.getElementById('debrief-note');
         view.note = note ? note.value : (view.note || '');
-        view.feel = view.feel === data.feel ? null : data.feel;
+        view.choice = view.choice === data.choice ? null : data.choice;
         render();
         return;
       }
       case 'save-debrief': {
         const session = state.sessions.find(x => x.id === data.id);
-        const text = (document.getElementById('debrief-note').value || '').trim();
-        if (!view.feel && !text) { go('today'); return; }
+        if (!session) { go('today', {}, { replace: true }); return; }
+        const box = document.getElementById('debrief-note');
+        const text = box ? box.value.trim() : '';
+        if (!view.choice && !text) { go('today', {}, { replace: true }); return; }
+        const ci = debriefCheckin(session);
         state.checkins.push({
           id: uid(), at: new Date().toISOString(), kind: 'session',
-          sessionId: data.id, sessionName: session ? session.name : '',
-          ...(view.feel ? { feel: view.feel } : {}),
+          sessionId: data.id, sessionName: session.name,
+          // Only a staged card is marked used; the built-in has to stay
+          // available for every session that follows.
+          ...(ci.id === DEFAULT_CHECKIN.id ? {} : { bankId: ci.id }),
+          question: ci.text,
+          ...(view.choice ? { choice: view.choice } : {}),
           ...(text ? { text } : {}),
         });
         save(); go('today', {}, { replace: true }); toast('Noted — the coach will see it.');
@@ -2343,6 +2449,36 @@
       }
       case 'skip-debrief': {
         go('today', {}, { replace: true });
+        return;
+      }
+      case 'ex-choice': {
+        const note = document.getElementById('ex-note');
+        view.exNote = note ? note.value : (view.exNote || '');
+        view.exChoice = view.exChoice === data.choice ? null : data.choice;
+        render();
+        return;
+      }
+      case 'save-excheckin': {
+        const ci = pickCheckin({ exercises: [data.exercise], date: ymd(), scope: 'exercise' });
+        if (!ci) return;
+        const box = document.getElementById('ex-note');
+        const text = box ? box.value.trim() : '';
+        if (!view.exChoice && !text) { toast('Pick one or write something.'); return; }
+        state.checkins.push({
+          id: uid(), at: new Date().toISOString(), kind: 'exercise',
+          exercise: data.exercise, bankId: ci.id, question: ci.text,
+          ...(view.exChoice ? { choice: view.exChoice } : {}),
+          ...(text ? { text } : {}),
+        });
+        view.exChoice = null; view.exNote = '';
+        save(); render(); toast('Answered.');
+        return;
+      }
+      // Not now means not now — the card returns next time this screen is
+      // opened rather than being spent.
+      case 'skip-excheckin': {
+        view.exSkip = true;
+        render();
         return;
       }
       case 'answer-question': {
