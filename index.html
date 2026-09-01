@@ -277,6 +277,8 @@
     // asked anything at the gym — it writes these ahead of time and the app
     // picks whichever fits, offline.
     coachCheckins: [],      // { id, text, scope, when, options, note, at }
+    coachShorts: [],        // { id, name, minutes, exercises: [name], note }
+    lapseSnooze: null,      // hide the "it's been a while" card up to this date
   };
 
   // Sync credentials live under their own key, deliberately outside `state`:
@@ -879,6 +881,7 @@
       // backup as much as the sets do.
       checkins: state.checkins,
       proposalsDone: state.proposalsDone,
+      lapseSnooze: state.lapseSnooze,
       coachSuggestions: state.coachSuggestions,
       prefs: state.prefs,
       sets: state.sets,
@@ -908,6 +911,7 @@
     next.coachSuggestions = p.coachSuggestions || {};
     next.checkins = Array.isArray(p.checkins) ? p.checkins : [];
     next.proposalsDone = Array.isArray(p.proposalsDone) ? p.proposalsDone : [];
+    next.lapseSnooze = p.lapseSnooze || null;
     next.goals = Array.isArray(p.goals) ? p.goals : [];
     if (p.profile && typeof p.profile === 'object') next.profile = Object.assign(structuredClone(BLANK.profile), p.profile);
     next.sessions = Array.isArray(p.sessions) ? p.sessions : [];
@@ -949,7 +953,7 @@
   // A push therefore carries the remote's own coach block back untouched, so
   // the two can never clobber each other.
   const SYNC_FILE = 'state.json';
-  const APP_FIELDS = ['schemaVersion', 'epoch', 'sets', 'exercises', 'routines', 'sessions', 'settings', 'goals', 'profile', 'prefs', 'checkins', 'proposalsDone'];
+  const APP_FIELDS = ['schemaVersion', 'epoch', 'sets', 'exercises', 'routines', 'sessions', 'settings', 'goals', 'profile', 'prefs', 'checkins', 'proposalsDone', 'lapseSnooze'];
 
   function appPayload() {
     const out = {};
@@ -972,6 +976,8 @@
     // suppress, so drop it rather than growing this list forever.
     state.coachCheckins = (Array.isArray(coach.checkins) ? coach.checkins : [])
       .filter(c => c && c.id && c.text);
+    state.coachShorts = (Array.isArray(coach.shortSessions) ? coach.shortSessions : [])
+      .filter(x => x && x.id && x.name && Array.isArray(x.exercises) && x.exercises.length);
     const live = new Set(state.coachProposals.map(x => x.id));
     state.proposalsDone = (state.proposalsDone || []).filter(id => live.has(id));
     return true;
@@ -1085,11 +1091,16 @@
     const todaySets = state.sets.filter(s => s.date === today);
     const session = activeSession();
     const workout = session ? workoutById(session.workoutId) : null;
+    // A short session is not a workout in a routine — it carries its own list,
+    // so the plan comes from whichever of the two exists.
+    const plan = workout ? workout.exercises : (session && session.exercises) || null;
+    const planName = workout ? workout.name : (session ? session.name : '');
     const skipped = (state.active && state.active.skipped) || [];
+    const gap = lapse();
 
     // Exercises to show: the workout's own order, minus anything skipped, plus
     // anything logged today that the workout didn't call for.
-    const planned = workout ? workout.exercises.filter(e => !skipped.includes(e)) : [];
+    const planned = plan ? plan.filter(e => !skipped.includes(e)) : [];
     const logged = [...new Set(todaySets.map(s => s.exercise))];
     const order = [...planned, ...logged.filter(e => !planned.includes(e))];
 
@@ -1098,10 +1109,13 @@
         ${order.map(name => {
           const sets = todaySets.filter(s => s.exercise === name);
           const sug = suggestionFor(name).shown;
-          const inWorkout = workout && workout.exercises.includes(name);
+          const inPlan = plan && plan.includes(name);
+          // Reordering writes back to the workout, and a short session has no
+          // workout to write to — so those rows are not draggable.
+          const canDrag = workout && workout.exercises.includes(name);
           return `
-          <div class="list-item drag-item" data-exercise="${esc(name)}"${inWorkout ? ' data-draggable="1"' : ''}>
-            ${inWorkout ? '<span class="grip" data-grip aria-hidden="true">⠿</span>' : ''}
+          <div class="list-item drag-item" data-exercise="${esc(name)}"${canDrag ? ' data-draggable="1"' : ''}>
+            ${canDrag ? '<span class="grip" data-grip aria-hidden="true">⠿</span>' : ''}
             <button class="grow rowbtn" data-go="log" data-exercise="${esc(name)}">
               <div class="name">${esc(name)}</div>
               <div class="meta mono">${esc(sets.length
@@ -1109,7 +1123,7 @@
                 : (sug ? `Target ${setLabel(sug, kindOf(name), true)}` : 'No history yet'))}</div>
             </button>
             ${sets.length ? `<span class="chip done">${sets.length}</span>` : '<span class="chip">to do</span>'}
-            ${inWorkout && !sets.length ? `<button class="x" data-act="skip-exercise" data-exercise="${esc(name)}" aria-label="Skip ${esc(name)} today">×</button>` : ''}
+            ${inPlan && !sets.length ? `<button class="x" data-act="skip-exercise" data-exercise="${esc(name)}" aria-label="Skip ${esc(name)} today">×</button>` : ''}
           </div>`;
         }).join('')}
       </div>` : '<div class="empty">Nothing logged yet today.<br>Start a workout, or add a single exercise.</div>';
@@ -1119,15 +1133,17 @@
       : 'Not started — logging your first set starts the clock';
 
     return {
-      title: session ? (workout ? workout.name : 'Workout') : 'Today',
+      title: session ? (planName || 'Workout') : 'Today',
       sub: session
         ? dur
         : new Date().toLocaleDateString(undefined, { weekday: 'long', day: 'numeric', month: 'long' }),
       html: `
-        ${session && workout ? `<div class="card" style="padding:0.6rem 0.9rem">
-          <div class="eyebrow">In progress${session.routineName ? ' · ' + esc(session.routineName) : ''}</div>
-          ${workout.exercises.length > 1 ? '<div class="muted" style="margin-top:0.2rem">Hold the ⠿ handle to reorder — the new order is saved to this workout.</div>' : ''}
+        ${session && plan ? `<div class="card" style="padding:0.6rem 0.9rem">
+          <div class="eyebrow">In progress${session.short ? ' · short session' : (session.routineName ? ' · ' + esc(session.routineName) : '')}</div>
+          ${workout && workout.exercises.length > 1 ? '<div class="muted" style="margin-top:0.2rem">Hold the ⠿ handle to reorder — the new order is saved to this workout.</div>' : ''}
         </div>` : ''}
+
+        ${gap ? lapseCard(gap) : ''}
 
         ${list}
 
@@ -1144,6 +1160,49 @@
           : `<button class="btn" data-go="routines">${state.routines.length ? 'Start a workout' : 'Set up a routine'}</button>`}
       `,
     };
+  }
+
+  // Named for what it is: the app noticing, not a streak counter keeping score.
+  // Everything here is one tap away from a session that actually happens.
+  function lapseCard(gap) {
+    const offers = shortSessions();
+    const head = gap.tone === 'back'
+      ? `${gap.days} days since you trained`
+      : gap.tone === 'gone'
+        ? `It has been ${gap.days} days`
+        : `${gap.days} days since your last session`;
+    const line = gap.tone === 'back'
+      ? 'Coming back is its own skill. Start smaller than feels right — the weights will keep.'
+      : gap.tone === 'gone'
+        ? 'A week goes quickly. Something short now beats a perfect session that does not happen.'
+        : 'Short counts. Twenty minutes of the right things is most of the benefit.';
+
+    return `<div class="card asks">
+      <div class="eyebrow">${esc(head)}</div>
+      <p class="muted" style="margin:0.4rem 0 0.8rem;line-height:1.5">
+        Last was ${esc(fmtDate(gap.last))}. ${esc(line)}
+      </p>
+      <div class="list-stack">
+        ${offers.map(o => `
+          <button class="btn ghost rowbtn" style="text-align:left;display:block" data-act="start-short" data-id="${esc(o.id)}">
+            <div style="font-weight:650">${esc(o.name)}${o.minutes ? ` · ${o.minutes} min` : ''}</div>
+            <div class="meta muted" style="margin-top:0.15rem">${esc(o.note || o.exercises.join(' · '))}</div>
+          </button>`).join('')}
+      </div>
+      ${view.lapseTell ? `
+        <div style="margin-top:0.8rem">
+          <label class="field-label" for="lapse-note">What is getting in the way?</label>
+          <textarea class="prose" id="lapse-note" placeholder="Back is still sore…"></textarea>
+          <div class="row" style="margin-top:0.5rem">
+            <button class="btn small" data-act="lapse-send">Tell the coach</button>
+            <button class="btn small ghost" data-act="lapse-cancel">Cancel</button>
+          </div>
+        </div>`
+        : `<div class="row" style="margin-top:0.7rem">
+            <button class="btn small ghost" data-act="lapse-tell">Something is up</button>
+            <button class="btn small ghost" data-act="lapse-snooze">Not today</button>
+          </div>`}
+    </div>`;
   }
 
   // A stepper field. Only the numeric measures get one — a time is typed as
@@ -1553,6 +1612,88 @@
     return pool[(state.checkins || []).length % pool.length];
   }
 
+  // ------------------------------------------------------- lapses
+  // A median gap of two days is the real rhythm here, so five days is a missed
+  // session, ten is a week gone and three weeks is a block ending. What changes
+  // with the number is the wording, not the offer — the offer is always
+  // something small and specific, because "train more" is not actionable and a
+  // vague twenty minutes is easy to decide isn't worth it.
+  const LAPSE_FROM = 5;
+
+  function lastTrainingDay() {
+    const days = [...new Set(state.sets.map(x => x.date))].sort();
+    return days.length ? days[days.length - 1] : null;
+  }
+  function lapse() {
+    if (activeSession()) return null;
+    const last = lastTrainingDay();
+    if (!last) return null;
+    const days = daysSince(last);
+    if (days < LAPSE_FROM) return null;
+    if (state.lapseSnooze && state.lapseSnooze >= ymd()) return null;
+    const tone = days >= 21 ? 'back' : days >= 10 ? 'gone' : 'missed';
+    return { last, days, tone };
+  }
+
+  // What you have actually been doing lately, which is the only honest basis
+  // for "here is a short version".
+  function topBy(n, filter = () => true, withinDays = null) {
+    const since = withinDays ? ymd(new Date(Date.now() - withinDays * 86400000)) : null;
+    const count = {};
+    for (const x of state.sets) {
+      if ((since && x.date < since) || !filter(x.exercise)) continue;
+      count[x.exercise] = (count[x.exercise] || 0) + 1;
+    }
+    return Object.entries(count).sort((a, b) => b[1] - a[1]).slice(0, n).map(([name]) => name);
+  }
+  // Recent first, because that is what "what you have been doing" means — but
+  // fall back to all of it, or a sparse category like cardio or bodyweight
+  // vanishes from the offers exactly when it would be the useful one.
+  function recentTop(n, filter = () => true) {
+    const recent = topBy(n, filter, 90);
+    if (recent.length >= n) return recent;
+    const rest = topBy(n, filter).filter(x => !recent.includes(x));
+    return [...recent, ...rest].slice(0, n);
+  }
+  // Word boundaries matter here: an unanchored "chin" matches Ma-chin-e and
+  // quietly calls every machine exercise bodyweight.
+  const BODYWEIGHT = /\b(push[- ]?ups?|pull[- ]?ups?|chin[- ]?ups?|dips?|planks?|lunges?|sit[- ]?ups?|crunch(es)?|burpees?|muscle[- ]?ups?)\b/i;
+
+  // The app's own offers, built from your own history so there is always
+  // something concrete to say yes to even when the coach has staged nothing.
+  function builtInShorts() {
+    const out = [];
+    const main = recentTop(3);
+    if (main.length) {
+      out.push({ id: 'short-main', name: 'The short version', minutes: 20, exercises: main,
+                 note: 'Three sets each of what you have been doing anyway.' });
+    }
+    const bw = recentTop(3, n => BODYWEIGHT.test(n) || (state.exercises[n] || {}).equipment === 'bodyweight');
+    if (bw.length >= 2) {
+      out.push({ id: 'short-bw', name: 'Bodyweight only', minutes: 15, exercises: bw,
+                 note: 'Nothing to load, nothing to set up.' });
+    }
+    // Cardio rarely has recent history — an imported list is full of machines
+    // never used. Take what you have logged if there is any, otherwise anything
+    // already in your list that reads as cardio, and only invent an entry when
+    // there is nothing at all.
+    let cardio = recentTop(2, n => kindOf(n) === 'distance-time');
+    if (!cardio.length) {
+      cardio = Object.keys(state.exercises).filter(n => kindOf(n) === 'distance-time').slice(0, 2);
+    }
+    out.push({ id: 'short-cardio', name: 'Cardio', minutes: 20,
+               exercises: cardio.length ? cardio : ['Cardio'],
+               note: 'Keeps the habit, spares the back.' });
+    return out;
+  }
+  // Staged offers come first — the coach knows what block you are in — and the
+  // built-ins top them up so there is always more than one way to say yes.
+  function shortSessions() {
+    const staged = state.coachShorts || [];
+    const names = new Set(staged.map(x => x.name));
+    return [...staged, ...builtInShorts().filter(x => !names.has(x.name))].slice(0, 4);
+  }
+
   function answeredQuestionIds() {
     return new Set((state.checkins || []).map(c => c.questionId).filter(Boolean));
   }
@@ -1573,7 +1714,8 @@
   function checkinLine(c) {
     const pick = c.choice || (c.feel ? (LEGACY_FEEL[c.feel] || c.feel) : '');
     let head;
-    if (c.kind === 'question') head = c.question || 'Coach question';
+    if (c.kind === 'lapse') head = `Away ${c.days != null ? c.days + ' days' : 'a while'}`;
+    else if (c.kind === 'question') head = c.question || 'Coach question';
     else if (c.kind === 'exercise') head = `${c.exercise || 'Exercise'}${pick ? ` — ${pick}` : ''}`;
     else head = `${c.sessionName || 'Session'}${pick ? ` — ${pick}` : ''}`;
     // A staged question is worth showing back; the built-in one never is.
@@ -2178,6 +2320,46 @@
         // what it is rather than the name heuristic guessing again next time.
         if (!state.exercises[data.exercise]) state.exercises[data.exercise] = { category: 'Uncategorized', kind };
         save(); render(); toast('Set saved.');
+        return;
+      }
+      case 'start-short': {
+        const offer = shortSessions().find(x => x.id === data.id);
+        if (!offer) return;
+        // An offer may name something you have never logged — the coach can
+        // suggest a bike you do not own an entry for yet.
+        for (const n of offer.exercises) if (!state.exercises[n]) state.exercises[n] = { category: 'Uncategorized' };
+        const session = {
+          id: uid(), date: ymd(), workoutId: null, routineId: null,
+          name: offer.name, routineName: '', exercises: offer.exercises.slice(),
+          short: true, startedAt: null, endedAt: null,
+        };
+        state.sessions.push(session);
+        state.active = { sessionId: session.id, skipped: [] };
+        state.lapseSnooze = ymd();
+        save(); go('today'); toast(`${offer.name} — go.`);
+        return;
+      }
+      case 'lapse-tell': { view.lapseTell = true; render(); return; }
+      case 'lapse-cancel': { view.lapseTell = false; render(); return; }
+      case 'lapse-send': {
+        const box = document.getElementById('lapse-note');
+        const text = box ? box.value.trim() : '';
+        if (!text) { toast('Say what is going on, or use Not today.'); return; }
+        const gap = lapse();
+        state.checkins.push({
+          id: uid(), at: new Date().toISOString(), kind: 'lapse',
+          question: 'What is getting in the way?', days: gap ? gap.days : null, text,
+        });
+        // Back off for a week. Being told why is the whole point; asking again
+        // tomorrow would make telling us pointless.
+        state.lapseSnooze = ymd(new Date(Date.now() + 7 * 86400000));
+        view.lapseTell = false;
+        save(); render(); toast('Noted — the coach will see it.');
+        return;
+      }
+      case 'lapse-snooze': {
+        state.lapseSnooze = ymd();
+        save(); render();
         return;
       }
       case 'start-workout': {

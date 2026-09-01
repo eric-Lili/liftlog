@@ -159,9 +159,9 @@ Ownership is structural rather than by agreement:
 ```
 state.json
   app     sets, exercises, routines, sessions, settings, goals, profile,
-          prefs, checkins, proposalsDone
+          prefs, checkins, proposalsDone, lapseSnooze
           — written only by LiftLog
-  coach   brief, suggestions, proposals, questions, checkins
+  coach   brief, suggestions, proposals, questions, checkins, shortSessions
           — written only by the coach
 ```
 
@@ -210,6 +210,36 @@ precisely the context a coach reasons from. So the conversation runs both ways.
 easy, about right, or hard, plus a note — and sometimes it is one the coach
 staged for you. It takes a couple of seconds and skipping is a real option: a
 prompt you cannot dismiss is a prompt you learn to lie to.
+
+### When you have been away
+
+Five days without a logged set puts a card at the top of **Today**. It is not a
+streak and it does not keep score — six lapses in two years, at least one of
+them an injury, and a counter would only have punished that. What it does is
+make saying yes cheap:
+
+```
+It has been 12 days
+  Back-safe 20 · 20 min      staged by the coach
+  The short version · 20 min the three things you have done most, three sets each
+  Bodyweight only · 15 min   nothing to load, nothing to set up
+  Cardio · 20 min            keeps the habit, spares the back
+  [Something is up]  [Not today]
+```
+
+Tapping one starts a session there and then, with those exercises and no
+routine behind it. The coach's own offers come first and the app's fill in
+behind them, so there is always something concrete even if the coach has never
+run.
+
+The wording hardens at ten days and again at twenty-one, but the offer never
+changes — the point is a specific short session, because "train more" is not
+actionable and a vague twenty minutes is easy to decide isn't worth it.
+
+**Something is up** takes a sentence, sends it to the coach as a `lapse`
+check-in and then leaves you alone for a week. Being told why is the whole
+point; asking again tomorrow would make telling it pointless. **Not today**
+hides the card until tomorrow.
 
 ### The staged bank
 

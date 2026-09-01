@@ -7,7 +7,8 @@
 the whole document for inspection.
 
 `write` replaces ONLY the `coach` block (brief, suggestions, proposals,
-questions, checkins). The app owns everything under `app`
+questions, checkins,
+shortSessions). The app owns everything under `app`
 and this script will not touch it — that separation is what stops the phone and
 the coach clobbering each other, so it is enforced here rather than trusted.
 
@@ -15,6 +16,7 @@ Authentication uses the `gh` CLI, so whatever `gh auth` is logged in as applies.
 """
 import argparse
 import base64
+import datetime
 import json
 import subprocess
 import sys
@@ -52,9 +54,11 @@ def summarise(doc):
     coach = doc.get("coach") or {}
     questions = coach.get("questions") or []
     bank = coach.get("checkins") or []
+    shorts = coach.get("shortSessions") or []
     print(f"coach: {len(coach.get('suggestions') or {})} suggestions, "
           f"{len(coach.get('proposals') or [])} proposals, "
           f"{len(questions)} questions, {len(bank)} staged check-ins, "
+          f"{len(shorts)} short sessions, "
           f"brief {'yes' if coach.get('brief') else 'no'}")
 
     # The check-ins are the half of the picture the sets cannot carry, so they
@@ -80,6 +84,20 @@ def summarise(doc):
             mark = " " if c.get("id") in used else "*"
             print(f"  {mark} [{c.get('id')}] ({c.get('scope', 'session')}, {rule}) {c.get('text', '')}")
 
+    if shorts:
+        print("\nshort sessions on offer:")
+        for x in shorts:
+            mins = f"{x['minutes']} min" if x.get("minutes") else "?"
+            print(f"  [{x.get('id')}] {x.get('name')} ({mins}) — {', '.join(x.get('exercises') or [])}")
+
+    # How long you have been away, which is what decides whether the app is
+    # currently showing that offer at all.
+    days = sorted({s["date"] for s in sets})
+    if days:
+        last = datetime.date.fromisoformat(days[-1])
+        idle = (datetime.date.today() - last).days
+        print(f"\nlast trained {days[-1]} — {idle} day{'' if idle == 1 else 's'} ago")
+
     recent = sorted(checkins, key=lambda c: str(c.get("at", "")), reverse=True)[:12]
     if recent:
         print(f"\n{len(checkins)} check-ins, most recent first:")
@@ -88,6 +106,9 @@ def summarise(doc):
             if c.get("kind") == "question":
                 print(f"  {when}  Q: {c.get('question', '')}")
                 print(f"              A: {c.get('text', '')}")
+            elif c.get("kind") == "lapse":
+                print(f"  {when}  away {c.get('days', '?')} days — said: {c.get('text', '')}")
+                continue
             else:
                 where = c.get("exercise") or c.get("sessionName")
                 bits = [b for b in (where, c.get("choice") or c.get("feel")) if b]
@@ -106,7 +127,8 @@ def validate_coach(coach):
     """Reject anything the app could not draw. Raises ValueError."""
     if not isinstance(coach, dict):
         fail("the coach block must be a JSON object")
-    unknown = set(coach) - {"brief", "suggestions", "proposals", "questions", "checkins"}
+    unknown = set(coach) - {"brief", "suggestions", "proposals", "questions",
+                            "checkins", "shortSessions"}
     if unknown:
         fail(f"unexpected keys in the coach block: {sorted(unknown)}")
 
@@ -144,6 +166,23 @@ def validate_coach(coach):
             fail(f"when.idleDays must be a whole number of days: {c['id']}")
         if c.get("scope") == "exercise" and not when.get("exercise"):
             fail(f"an exercise-scope check-in needs when.exercise: {c['id']}")
+
+    # Short sessions are offered when a lapse is detected, and are started with
+    # one tap — so an entry with no exercises would hand over an empty workout.
+    seen = set()
+    for x in coach.get("shortSessions") or []:
+        if not isinstance(x, dict) or not x.get("id") or not x.get("name"):
+            fail(f"every short session needs an id and a name: {x!r}")
+        if x["id"] in seen:
+            fail(f"duplicate short session id: {x['id']}")
+        seen.add(x["id"])
+        ex = x.get("exercises")
+        if not isinstance(ex, list) or not ex or not all(isinstance(n, str) and n for n in ex):
+            fail(f"a short session needs a non-empty list of exercise names: {x['id']}")
+        if len(ex) > 5:
+            fail(f"{x['id']}: {len(ex)} exercises is not a short session")
+        if "minutes" in x and not isinstance(x["minutes"], int):
+            fail(f"minutes must be a whole number: {x['id']}")
 
 
 
