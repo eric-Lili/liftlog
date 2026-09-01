@@ -40,6 +40,10 @@
   }
 
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  /* The scroller here is the root element, not the body, so this has to sit on
+     html or the browser keeps its own pull-to-refresh — which reloaded the app
+     and dropped you back on Today. */
+  html { overscroll-behavior-y: contain; }
   html, body { height: 100%; }
   body {
     margin: 0;
@@ -204,6 +208,17 @@
   .brief p { margin: 0 0 0.7rem; }
   .brief p:last-child { margin-bottom: 0; }
   .btn[disabled] { opacity: 0.6; pointer-events: none; }
+
+  .pull {
+    position: fixed; top: 0; left: 0; right: 0; height: 56px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 0.72rem; font-weight: 700; letter-spacing: 0.09em;
+    text-transform: uppercase; color: var(--ink-soft);
+    background: var(--paper); border-bottom: 1px solid var(--rule);
+    transform: translateY(-56px); pointer-events: none; z-index: 30;
+  }
+  .pull.armed { color: var(--clay); }
+  .pull.settling { transition: transform 0.22s ease; }
   input[type="password"] {
     width: 100%; border: 1px solid var(--rule); border-radius: 10px; background: var(--paper);
     padding: 0.6rem 0.7rem; font-size: 0.92rem; color: var(--ink);
@@ -246,6 +261,10 @@
     // { id, at, kind: 'session' | 'question', sessionId?, questionId?,
     //   question?, feel?: 'easy'|'right'|'hard', text? }
     checkins: [],
+    // Proposals you have already accepted or dismissed. App-owned on purpose:
+    // a sync replaces the whole coach block with the server's, so without this
+    // every card you dealt with came straight back.
+    proposalsDone: [],
     coachSeenAt: null,      // when the Coach tab was last opened; drives the badge
     // Written by the coach, never by the app — see the ownership note in sync().
     coachSuggestions: {},   // name -> { weight, reps, note }
@@ -377,7 +396,25 @@
     toast._t = setTimeout(() => t.classList.remove('show'), 1900);
   }
 
-  function go(name, extra = {}) { view = Object.assign({ name }, extra); render(); window.scrollTo(0, 0); }
+  // Every screen is a history entry, so the phone's own back and forward
+  // gestures walk them. Without this the app owned no entries at all and a
+  // back swipe left the app entirely.
+  //
+  // `replace` is for a screen that should not be returned to — the debrief
+  // after it has been answered, which would otherwise let you file the same
+  // check-in twice by swiping back.
+  function go(name, extra = {}, { replace = false } = {}) {
+    view = Object.assign({ name }, extra);
+    try { history[replace ? 'replaceState' : 'pushState'](view, ''); } catch { /* history is a nicety */ }
+    render();
+    window.scrollTo(0, 0);
+  }
+
+  window.addEventListener('popstate', ev => {
+    view = ev.state && ev.state.name ? ev.state : { name: 'today' };
+    render();
+    window.scrollTo(0, 0);
+  });
   // Which dataset attributes carry through a navigation.
   function navArgs(ds) {
     const out = {};
@@ -835,6 +872,7 @@
       // Answers you gave once and cannot reconstruct — they belong in the
       // backup as much as the sets do.
       checkins: state.checkins,
+      proposalsDone: state.proposalsDone,
       coachSuggestions: state.coachSuggestions,
       prefs: state.prefs,
       sets: state.sets,
@@ -863,6 +901,7 @@
     for (const [name, cfg] of Object.entries(p.settings || {})) next.settings[name] = cfg;
     next.coachSuggestions = p.coachSuggestions || {};
     next.checkins = Array.isArray(p.checkins) ? p.checkins : [];
+    next.proposalsDone = Array.isArray(p.proposalsDone) ? p.proposalsDone : [];
     next.goals = Array.isArray(p.goals) ? p.goals : [];
     if (p.profile && typeof p.profile === 'object') next.profile = Object.assign(structuredClone(BLANK.profile), p.profile);
     next.sessions = Array.isArray(p.sessions) ? p.sessions : [];
@@ -904,7 +943,7 @@
   // A push therefore carries the remote's own coach block back untouched, so
   // the two can never clobber each other.
   const SYNC_FILE = 'state.json';
-  const APP_FIELDS = ['schemaVersion', 'epoch', 'sets', 'exercises', 'routines', 'sessions', 'settings', 'goals', 'profile', 'prefs', 'checkins'];
+  const APP_FIELDS = ['schemaVersion', 'epoch', 'sets', 'exercises', 'routines', 'sessions', 'settings', 'goals', 'profile', 'prefs', 'checkins', 'proposalsDone'];
 
   function appPayload() {
     const out = {};
@@ -923,6 +962,10 @@
     // both there is nothing the app can usefully draw.
     state.coachQuestions = (Array.isArray(coach.questions) ? coach.questions : [])
       .filter(q => q && q.id && q.text);
+    // Once the coach stops offering a proposal there is nothing left to
+    // suppress, so drop it rather than growing this list forever.
+    const live = new Set(state.coachProposals.map(x => x.id));
+    state.proposalsDone = (state.proposalsDone || []).filter(id => live.has(id));
     return true;
   }
   function adoptApp(app) {
@@ -1501,7 +1544,7 @@
   // a 16-week programme is not something to discover mid-session.
   function coachView() {
     const brief = state.coachBrief;
-    const props = state.coachProposals || [];
+    const props = (state.coachProposals || []).filter(x => !(state.proposalsDone || []).includes(x.id));
     const sugg = Object.entries(state.coachSuggestions || {});
     const open = openQuestions();
     const log = recentCheckins();
@@ -1944,6 +1987,12 @@
     toast('Order saved.');
   }
 
+  // Recorded rather than deleted: the proposal itself belongs to the coach and
+  // will still be in the block the next sync brings down.
+  function markProposalDone(id) {
+    if (!state.proposalsDone.includes(id)) state.proposalsDone.push(id);
+  }
+
   // The coach can propose structural changes, but only from this fixed
   // vocabulary — an accepted proposal is applied by the app, not executed as
   // whatever the agent felt like writing. Anything unrecognised is shown and
@@ -2289,11 +2338,11 @@
           ...(view.feel ? { feel: view.feel } : {}),
           ...(text ? { text } : {}),
         });
-        save(); go('today'); toast('Noted — the coach will see it.');
+        save(); go('today', {}, { replace: true }); toast('Noted — the coach will see it.');
         return;
       }
       case 'skip-debrief': {
-        go('today');
+        go('today', {}, { replace: true });
         return;
       }
       case 'answer-question': {
@@ -2346,14 +2395,14 @@
         const p = (state.coachProposals || []).find(x => x.id === data.id);
         if (!p) return;
         const applied = applyProposal(p);
-        state.coachProposals = state.coachProposals.filter(x => x.id !== data.id);
+        markProposalDone(p.id);
         state.epoch = (state.epoch || 1) + 1;
         save(); render();
         toast(applied ? 'Applied.' : 'Noted — nothing to change automatically.');
         return;
       }
       case 'dismiss-proposal': {
-        state.coachProposals = (state.coachProposals || []).filter(x => x.id !== data.id);
+        markProposalDone(data.id);
         save(); render();
         return;
       }
@@ -2376,7 +2425,63 @@
     }
   }
 
+  // ------------------------------------------------------- pull to sync
+  // The gesture already means "get me the latest", so it does that instead of
+  // reloading. A drag only ever starts on a grip handle, so the two gestures
+  // cannot be confused for one another.
+  const PULL_MAX = 56;
+  const PULL_ARM = 46;
+  function wirePullToSync() {
+    const bar = document.createElement('div');
+    bar.className = 'pull';
+    document.body.appendChild(bar);
+
+    let startY = null, armed = false;
+
+    function settle() {
+      bar.classList.add('settling');
+      bar.style.transform = '';
+      bar.classList.remove('armed');
+      setTimeout(() => bar.classList.remove('settling'), 240);
+      startY = null; armed = false;
+    }
+
+    document.addEventListener('touchstart', ev => {
+      if (ev.touches.length !== 1 || syncing) return;
+      if (ev.target.closest && ev.target.closest('[data-grip]')) return;
+      if ((window.scrollY || document.documentElement.scrollTop || 0) > 0) return;
+      bar.classList.remove('settling');
+      startY = ev.touches[0].clientY;
+    }, { passive: true });
+
+    document.addEventListener('touchmove', ev => {
+      if (startY === null) return;
+      const dy = ev.touches[0].clientY - startY;
+      // An upward move is an ordinary scroll — hand the gesture back.
+      if (dy <= 0) { settle(); return; }
+      ev.preventDefault();
+      const shift = Math.min(dy * 0.5, PULL_MAX);
+      armed = shift >= PULL_ARM;
+      bar.style.transform = `translateY(${shift - PULL_MAX}px)`;
+      bar.classList.toggle('armed', armed);
+      bar.textContent = armed ? 'Release to sync' : 'Pull to sync';
+    }, { passive: false });
+
+    document.addEventListener('touchend', () => {
+      if (startY === null) return;
+      const fire = armed;
+      settle();
+      if (!fire) return;
+      if (!syncConfigured()) { toast('Sync isn’t set up yet.'); return; }
+      runSync();
+    }, { passive: true });
+
+    document.addEventListener('touchcancel', () => { if (startY !== null) settle(); }, { passive: true });
+  }
+
+  history.replaceState(view, '');
   render();
+  wirePullToSync();
 
   // Opportunistic sync: on open, when connectivity returns, and when the app
   // comes back to the foreground. Never blocking, and silent unless it fails.

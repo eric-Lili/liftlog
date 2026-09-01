@@ -27,6 +27,20 @@ and anything logged carry over — for when you started the wrong one), or
 did lift them. Completing a workout with nothing logged discards it rather than
 recording an empty one.
 
+## On the phone
+
+Every screen is a history entry, so the back and forward gestures walk them the
+way they do in any other app. The one exception is the post-session debrief:
+once answered it is replaced rather than pushed, so swiping back cannot file the
+same check-in twice.
+
+**Pull down to sync.** The browser's own pull-to-refresh reloaded the whole app
+and dropped you back on Today, which is never what the gesture meant here — so
+it is suppressed (on `html`, which is the scrolling element; setting it on
+`body` alone does nothing) and wired to a sync instead. Pull past the halfway
+mark and release. A reorder drag can only start on a grip handle, so the two
+gestures never collide.
+
 ## What a set is
 
 Not everything is weight × reps, so an exercise declares which measures its sets
@@ -145,7 +159,7 @@ Ownership is structural rather than by agreement:
 ```
 state.json
   app     sets, exercises, routines, sessions, settings, goals, profile,
-          prefs, checkins
+          prefs, checkins, proposalsDone
           — written only by LiftLog
   coach   brief, suggestions, proposals, questions
           — written only by the coach
@@ -173,6 +187,11 @@ The token is stored under its own key, so it never appears in a backup file or
 in the synced data.
 
 ### What the coach can do
+
+Accepting or dismissing a proposal is remembered in `app.checkins`' neighbour,
+`app.proposalsDone` — app-owned, because a sync replaces the whole `coach` block
+with the server's copy and a card you had already dealt with would otherwise come
+straight back. The list is pruned as the coach stops offering those proposals.
 
 The **Coach** tab shows its written assessment, any per-exercise calls (which
 replace the app's own suggestion for that lift), and **proposals** — structural
