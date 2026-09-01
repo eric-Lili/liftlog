@@ -11,7 +11,7 @@ telling you what to load next.
 Routine      a complete programme, run for a block of weeks
   Workout      one session's worth of work, exercises in a fixed order
     Exercise     position within the workout matters
-      Set          weight × reps — weight may be negative
+      Set          the measures its exercise records (see below)
 
 Session      one performance of a Workout. Starts when you log the first
              set, ends when you tap Complete, and owns the sets between.
@@ -27,6 +27,28 @@ and anything logged carry over — for when you started the wrong one), or
 did lift them. Completing a workout with nothing logged discards it rather than
 recording an empty one.
 
+## What a set is
+
+Not everything is weight × reps, so an exercise declares which measures its sets
+carry — its **kind**:
+
+| Kind | Records | Typically |
+|------|---------|-----------|
+| Weight × reps | weight, reps | the lifts |
+| Weight × time | weight, duration | planks and other holds |
+| Weight × distance | weight, distance | farmers walks, sled work |
+| Distance & time | distance, duration | cardio |
+
+Weight is optional on everything but the first — a bodyweight plank is a plank —
+and may be negative on assisted machines. Durations are stored in seconds and
+distances in metres however they were typed, so two sets are always comparable.
+
+The kind decides what the log screen asks for and how the set reads back
+("80 kg × 5", "12kg 1:00", "25kg 20m", "5.2km 28:00"). It is taken from the
+FitNotes import, then from a set you log, then from the exercise's name — and
+you can set it by hand under **Exercise settings**. Changing it never rewrites
+sets already logged.
+
 ## Why
 
 FitNotes is a good logger but has no progression logic — you decide the
@@ -36,7 +58,8 @@ every exercise screen.
 
 ## How progression works
 
-Two rules, picked per exercise:
+Progression is about load, so it applies to weight × reps work. Two rules,
+picked per exercise:
 
 - **Heavy** — for compounds you don't take to failure. The weight goes up on
   a clock: a small increment (default 1.25 kg) every N weeks, regardless of
@@ -71,6 +94,11 @@ to repeating your last session rather than adding load — coming back from a
 layoff you've detrained, and progressing from where you left off is how people
 get hurt.
 
+**Time and distance work is logged, not programmed.** Adding five seconds to a
+plank on a clock would be arithmetic dressed up as coaching, so for those kinds
+the app shows your best set from last time and asks you to match or beat it —
+with the same layoff warning when you've been away.
+
 ## Setup
 
 1. Open the site and add it to your home screen (Chrome: ⋮ → *Add to home
@@ -88,10 +116,11 @@ FitNotes routines are a set of named sections, usually the days of a split;
 LiftLog routines are flat, so the converter turns each section into its own
 routine (`Moose · Day 1 - Squat Lower Body`).
 
-FitNotes also tracks duration and distance work — planks, farmers walks,
-cardio. LiftLog only models weight × reps, so those sets aren't carried over.
-The exercises themselves are, since routines reference them, and they say so
-on their own screen instead of offering a meaningless suggestion.
+FitNotes' duration and distance work — planks, farmers walks, cardio — comes
+across with everything else: the converter reads each exercise's FitNotes type
+and carries the times and distances the sets were logged with. An exercise whose
+type LiftLog doesn't recognise is imported unclassified and settled from its
+name, which you can correct on its own screen.
 
 ## Data
 
@@ -101,8 +130,9 @@ it, so export now and then:
 
 - **Data → Backup file → Download** — the complete picture, including routines
   and progression settings. This is the one to keep.
-- **Data → Download CSV** — sets only, in FitNotes' own format, for feeding the
-  Ledger coaching app or moving back to FitNotes.
+- **Data → Download CSV** — sets only, in FitNotes' own columns (including
+  `Distance`, `Distance Unit` and `Time`), for feeding the Ledger coaching app
+  or moving back to FitNotes.
 
 ## Sync and the coach
 

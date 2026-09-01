@@ -220,7 +220,9 @@
   const BLANK = {
     schemaVersion: SCHEMA,
     epoch: 1,           // bumped on any wholesale replace; a higher epoch wins a sync
-    sets: [],           // { id, date, exercise, weight, reps, notes, src, sessionId }
+    sets: [],           // { id, date, exercise, notes, src, sessionId } + the
+                        // measures its exercise records: weight, reps,
+                        // distance (metres), duration (seconds)
     exercises: {},      // name -> { category, kind, equipment }
     routines: [],       // { id, name, weeks, workouts: [{ id, name, exercises: [name] }] }
     sessions: [],       // { id, date, routineId, workoutId, name, startedAt, endedAt }
@@ -329,6 +331,24 @@
     return Math.round((Date.now() - new Date(y, m - 1, d).getTime()) / 86400000);
   }
   function num(w) { return String(Math.round(w * 100) / 100); }
+
+  // Duration is stored in seconds and distance in metres, whatever was typed —
+  // one canonical unit each is what makes two sets comparable.
+  function fmtDuration(sec) {
+    const s = Math.max(0, Math.round(sec || 0));
+    const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), r = s % 60;
+    const mmss = `${m}:${String(r).padStart(2, '0')}`;
+    return h ? `${h}:${String(m).padStart(2, '0')}:${String(r).padStart(2, '0')}` : mmss;
+  }
+  // "90" is ninety seconds, "1:30" is the same, "1:05:00" is an hour and five.
+  function parseDuration(v) {
+    const t = String(v == null ? '' : v).trim();
+    if (!/^\d+(:\d{1,2}){0,2}$/.test(t)) return NaN;
+    return t.split(':').map(Number).reduce((a, p) => a * 60 + p, 0);
+  }
+  function fmtDistance(m) {
+    return m >= 1000 ? `${num(Math.round(m / 10) / 100)} km` : `${num(m)} m`;
+  }
   function uid() { return Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4); }
 
   function toast(msg) {
@@ -357,12 +377,58 @@
   function categoryOf(name) {
     return (state.exercises[name] && state.exercises[name].category) || 'Uncategorized';
   }
-  // FitNotes also tracks duration and distance exercises (planks, farmers
-  // walks, cardio). LiftLog only models weight x reps, but those exercises are
-  // still imported so routines referencing them stay complete.
-  function isWeightExercise(name) {
-    const e = state.exercises[name];
-    return !e || e.kind !== 'other';
+  // ------------------------------------------------------------------ kinds
+  // Not everything is weight x reps. A plank is weight x time, a farmers walk
+  // is weight x distance, a row on the erg is distance x time. A *kind* is
+  // simply which measures a set carries; the log screen, the history line, the
+  // suggestion and the CSV columns are all derived from this table rather than
+  // special-cased, so adding a kind means adding a row here.
+  const KINDS = {
+    'weight':          { label: 'Weight × reps',     measures: ['weight', 'reps'] },
+    'weight-time':     { label: 'Weight × time',     measures: ['weight', 'duration'] },
+    'weight-distance': { label: 'Weight × distance', measures: ['weight', 'distance'] },
+    'distance-time':   { label: 'Distance & time',   measures: ['distance', 'duration'] },
+  };
+  const MEASURES = ['weight', 'reps', 'distance', 'duration'];
+
+  function kindOf(name) {
+    const k = state.exercises[name] && state.exercises[name].kind;
+    // 'other' is what the first importer wrote for everything that wasn't
+    // weight x reps, and what an unrecognised FitNotes type still writes: it
+    // means "not classified", so fall back to the name.
+    return KINDS[k] ? k : defaultKind(name);
+  }
+
+  function defaultKind(name) {
+    // Evidence beats the name: anything with reps already logged against it is
+    // weight x reps, whatever it happens to be called.
+    if (state.sets.some(s => s.exercise === name && Number.isFinite(s.reps))) return 'weight';
+    if (/tread|running|\brun\b|cycling|\bbike\b|rowing machine|swim|elliptical|stair|walking|cardio|erg/i.test(name)) return 'distance-time';
+    if (/farmer|carry|sled|prowler|yoke|suitcase/i.test(name)) return 'weight-distance';
+    if (/plank|\bhold\b|\bhang\b|wall sit|isometric/i.test(name)) return 'weight-time';
+    return 'weight';
+  }
+
+  // One measure, written the way it reads. `compact` is the dense list form.
+  function fmtMeasure(m, v, compact) {
+    if (m === 'reps') return String(v);
+    if (m === 'weight') return compact ? `${num(v)}kg` : `${num(v)} kg`;
+    if (m === 'duration') return fmtDuration(v);
+    return compact ? fmtDistance(v).replace(' ', '') : fmtDistance(v);
+  }
+  // One set — or one suggested set, which carries the same measures — written
+  // for its kind: "80 kg x 5", "12kg 1:00", "25kg 20m", "5.2km 28:00".
+  function setLabel(o, kind, compact) {
+    const k = kind || kindOf(o.exercise);
+    const has = m => o[m] != null && Number.isFinite(+o[m]);
+    if (k === 'weight' && has('weight') && has('reps')) {
+      return compact ? `${num(o.weight)}×${o.reps}` : `${num(o.weight)} kg × ${o.reps}`;
+    }
+    // Fall back to whatever the set does carry: changing an exercise's kind
+    // must not blank out what was logged under the old one.
+    let ms = KINDS[k].measures.filter(has);
+    if (!ms.length) ms = MEASURES.filter(has);
+    return ms.map(m => fmtMeasure(m, o[m], compact)).join(compact ? ' ' : ' · ') || '—';
   }
   // One exercise's history, grouped by training day. (Not to be confused with a
   // Session, which is one performance of a whole Workout.)
@@ -425,7 +491,7 @@
   // lift cannot be built from the configured bar and plates, the assumption is
   // wrong, so stop making claims about plates for it.
   function barFitsHistory(name) {
-    const weights = state.sets.filter(s => s.exercise === name).map(s => s.weight);
+    const weights = state.sets.filter(s => s.exercise === name).map(s => s.weight).filter(Number.isFinite);
     if (!weights.length) return true;
     return weights.every(w => plateBreakdown(w) !== null);
   }
@@ -503,6 +569,7 @@
   function autoSuggest(name) {
     const sessions = historyFor(name).filter(s => s.date !== ymd());
     if (!sessions.length) return null;
+    if (kindOf(name) !== 'weight') return repeatSuggest(name, sessions);
     const cfg = settingsFor(name);
     const last = sessions[sessions.length - 1];
     const topWeight = Math.max(...last.sets.map(s => s.weight));
@@ -555,6 +622,32 @@
     };
   }
 
+  // Time and distance work is logged here, not programmed. LiftLog's
+  // progression model is about load, and adding five seconds to a plank on a
+  // clock would be arithmetic dressed up as coaching — the honest thing it can
+  // do is put last time's best set in front of you and ask for that or better.
+  function repeatSuggest(name, sessions) {
+    const kind = kindOf(name);
+    const last = sessions[sessions.length - 1];
+    const best = bestSet(last.sets, kind);
+    if (!best) return null;
+    const gap = daysSince(last.date);
+    const out = {
+      note: gap > STALE_DAYS
+        ? `First time back in ${Math.round(gap / 7)} weeks — match this before you push past it.`
+        : `Match or beat your best set from ${fmtDate(last.date).toLowerCase()}.`,
+    };
+    for (const m of KINDS[kind].measures) if (Number.isFinite(best[m])) out[m] = best[m];
+    return out;
+  }
+  // The best set of a session is the one that went furthest on the kind's
+  // leading measure — the longest hold, the longest carry — with weight
+  // breaking the ties.
+  function bestSet(sets, kind) {
+    const lead = KINDS[kind].measures.includes('distance') ? 'distance' : 'duration';
+    return [...sets].sort((a, b) => ((a[lead] || 0) - (b[lead] || 0)) || ((a.weight || 0) - (b.weight || 0))).pop();
+  }
+
   // On an assisted machine the number is help, not load, so "more weight" is
   // actually less assistance — say that rather than "+2.5kg".
   function addedLoad(cfg) {
@@ -603,9 +696,19 @@
     return out;
   }
 
+  // FitNotes writes a distance in whatever unit was on screen; LiftLog stores
+  // metres. Anything unrecognised is left as typed rather than silently scaled.
+  const DISTANCE_TO_M = {
+    m: 1, metre: 1, metres: 1, meter: 1, meters: 1,
+    km: 1000, kilometre: 1000, kilometres: 1000, kilometer: 1000, kilometers: 1000,
+    mi: 1609.344, mile: 1609.344, miles: 1609.344,
+    yd: 0.9144, yard: 0.9144, yards: 0.9144,
+    ft: 0.3048, feet: 0.3048,
+  };
+
   // FitNotes export columns: Date, Exercise, Category, Weight (kg) /
-  // Weight (lbs), Reps, Distance, Time, Notes. Headers are matched loosely so
-  // differences between app versions don't break the import.
+  // Weight (lbs), Reps, Distance, Distance Unit, Time, Notes. Headers are
+  // matched loosely so differences between app versions don't break the import.
   function parseFitNotes(text) {
     const lines = text.split(/\r?\n/).filter(l => l.trim());
     if (!lines.length) return { sets: [], exercises: {} };
@@ -618,6 +721,9 @@
     const iKg = at(h => h.includes('weight') && h.includes('kg'));
     const iLb = at(h => h.includes('weight') && (h.includes('lb') || h.includes('pound')));
     const iPlain = at(h => h === 'weight');
+    const iDist = at(h => h.includes('distance') && !h.includes('unit'));
+    const iDistUnit = at(h => h.includes('distance') && h.includes('unit'));
+    const iTime = at(h => h === 'time' || h.includes('duration'));
     const iNote = at(h => h.includes('note') || h.includes('comment'));
 
     const sets = [], exercises = {};
@@ -628,33 +734,64 @@
       if (!date || !exercise) continue;
 
       const cat = iCat >= 0 ? (c[iCat] || '').trim() : '';
-      if (!exercises[exercise] || (cat && exercises[exercise].category === 'Uncategorized')) {
-        exercises[exercise] = { category: cat || 'Uncategorized' };
-      }
+      if (!exercises[exercise]) exercises[exercise] = { category: cat || 'Uncategorized' };
+      else if (cat && exercises[exercise].category === 'Uncategorized') exercises[exercise].category = cat;
 
       let weight = NaN;
       if (iKg >= 0 && c[iKg]) weight = parseFloat(c[iKg]);
       else if (iPlain >= 0 && c[iPlain]) weight = parseFloat(c[iPlain]);
       else if (iLb >= 0 && c[iLb]) weight = parseFloat(c[iLb]) * 0.453592;
       const reps = iReps >= 0 ? parseInt(c[iReps], 10) : NaN;
-      // Cardio / distance-only rows have no weight+reps pair; skip them but
-      // keep the exercise itself so it still shows up in the list.
-      if (!Number.isFinite(weight) || !Number.isFinite(reps)) continue;
 
-      sets.push({
+      let distance = iDist >= 0 ? parseFloat(c[iDist]) : NaN;
+      if (Number.isFinite(distance)) {
+        const unit = (iDistUnit >= 0 ? (c[iDistUnit] || '') : '').trim().toLowerCase();
+        distance *= DISTANCE_TO_M[unit] || 1;
+      }
+      const duration = iTime >= 0 ? parseDuration(c[iTime]) : NaN;
+
+      // A row is a set if it carries reps, a distance or a time. What it
+      // carries also says what the exercise is: FitNotes doesn't export the
+      // type, but a row of 20 metres under load can only be a carry.
+      const kind = reps > 0 ? 'weight'
+        : (distance > 0 && duration > 0) ? 'distance-time'
+        : distance > 0 ? 'weight-distance'
+        : duration > 0 ? 'weight-time'
+        : null;
+      if (!kind) continue;
+      // Weight × reps wins any disagreement — an exercise with real reps in it
+      // is not reclassified by one stray cardio row.
+      if (exercises[exercise].kind !== 'weight') exercises[exercise].kind = kind;
+
+      const set = {
         id: uid(), date, exercise,
-        weight: Math.round(weight * 100) / 100, reps,
         notes: iNote >= 0 ? (c[iNote] || '').trim() : '',
         src: 'fitnotes',
-      });
+      };
+      if (Number.isFinite(weight)) set.weight = Math.round(weight * 100) / 100;
+      if (Number.isFinite(reps)) set.reps = reps;
+      if (Number.isFinite(distance)) set.distance = Math.round(distance * 100) / 100;
+      if (Number.isFinite(duration)) set.duration = duration;
+      // Weight × reps needs both halves; the other kinds are their own proof.
+      if (kind === 'weight' && !Number.isFinite(set.weight)) continue;
+      sets.push(set);
     }
     return { sets, exercises };
   }
 
+  // FitNotes' own column set, so a LiftLog CSV still loads anywhere that reads
+  // a FitNotes one. Distance goes out in metres — the unit column says so.
   function toCsv() {
-    const rows = [['Date', 'Exercise', 'Category', 'Weight (kg)', 'Reps', 'Notes']];
+    const rows = [['Date', 'Exercise', 'Category', 'Weight (kg)', 'Reps', 'Distance', 'Distance Unit', 'Time', 'Notes']];
+    const col = (s, m) => Number.isFinite(s[m]) ? num(s[m]) : '';
     for (const s of [...state.sets].sort((a, b) => a.date.localeCompare(b.date))) {
-      rows.push([s.date, s.exercise, categoryOf(s.exercise), num(s.weight), String(s.reps), s.notes || '']);
+      rows.push([
+        s.date, s.exercise, categoryOf(s.exercise),
+        col(s, 'weight'), col(s, 'reps'),
+        col(s, 'distance'), Number.isFinite(s.distance) ? 'm' : '',
+        Number.isFinite(s.duration) ? fmtDuration(s.duration) : '',
+        s.notes || '',
+      ]);
     }
     return rows.map(r => r.map(f => /[",\n]/.test(f) ? `"${f.replace(/"/g, '""')}"` : f).join(',')).join('\n');
   }
@@ -693,7 +830,10 @@
     for (const [name, meta] of Object.entries(p.exercises)) {
       next.exercises[name] = {
         category: (meta && meta.category) || 'Uncategorized',
-        kind: (meta && meta.kind) || 'weight',
+        // An unknown kind — including the 'other' the first importer wrote for
+        // everything that wasn't weight × reps — means "not classified", and is
+        // resolved from the name and the sets themselves.
+        kind: (meta && KINDS[meta.kind]) ? meta.kind : 'other',
         ...(meta && meta.equipment ? { equipment: meta.equipment } : {}),
       };
     }
@@ -709,16 +849,25 @@
         : { id: uid(), name: r.name, weeks: null, workouts: [{ id: uid(), name: r.name, exercises: Array.isArray(r.exercises) ? r.exercises : [] }] }
     ));
 
-    next.sets = p.sets.map(s => (
-      Array.isArray(s)
-        // v1 compact form — no id, notes or src survived the export.
-        ? (s.length >= 4 && Number.isFinite(+s[2]) && Number.isFinite(+s[3])
-            ? { id: uid(), date: String(s[0]), exercise: String(s[1]), weight: +s[2], reps: +s[3], notes: '', src: 'fitnotes' }
-            : null)
-        : (s && Number.isFinite(+s.weight) && Number.isFinite(+s.reps)
-            ? { id: s.id || uid(), date: String(s.date), exercise: String(s.exercise), weight: +s.weight, reps: +s.reps, notes: s.notes || '', src: s.src || 'fitnotes', ...(s.sessionId ? { sessionId: s.sessionId } : {}) }
-            : null)
-    )).filter(Boolean);
+    const has = (s, m) => s[m] != null && s[m] !== '' && Number.isFinite(+s[m]);
+    next.sets = p.sets.map(s => {
+      // v1 compact form — no id, notes or src survived the export.
+      if (Array.isArray(s)) {
+        return s.length >= 4 && Number.isFinite(+s[2]) && Number.isFinite(+s[3])
+          ? { id: uid(), date: String(s[0]), exercise: String(s[1]), weight: +s[2], reps: +s[3], notes: '', src: 'fitnotes' }
+          : null;
+      }
+      // Any set carrying at least one measure is a set: weight × reps, a hold's
+      // time, a carry's distance.
+      if (!s || !s.date || !s.exercise || !MEASURES.some(m => has(s, m))) return null;
+      const out = {
+        id: s.id || uid(), date: String(s.date), exercise: String(s.exercise),
+        notes: s.notes || '', src: s.src || 'fitnotes',
+        ...(s.sessionId ? { sessionId: s.sessionId } : {}),
+      };
+      for (const m of MEASURES) if (has(s, m)) out[m] = +s[m];
+      return out;
+    }).filter(Boolean);
 
     return next;
   }
@@ -875,9 +1024,9 @@
             ${inWorkout ? '<span class="grip" data-grip aria-hidden="true">⠿</span>' : ''}
             <button class="grow rowbtn" data-go="log" data-exercise="${esc(name)}">
               <div class="name">${esc(name)}</div>
-              <div class="meta mono">${sets.length
-                ? sets.map(s => `${num(s.weight)}×${s.reps}`).join('  ·  ')
-                : (sug ? `Target ${num(sug.weight)}kg × ${sug.reps}` : 'No history yet')}</div>
+              <div class="meta mono">${esc(sets.length
+                ? sets.map(s => setLabel(s, null, true)).join('  ·  ')
+                : (sug ? `Target ${setLabel(sug, kindOf(name), true)}` : 'No history yet'))}</div>
             </button>
             ${sets.length ? `<span class="chip done">${sets.length}</span>` : '<span class="chip">to do</span>'}
             ${inWorkout && !sets.length ? `<button class="x" data-act="skip-exercise" data-exercise="${esc(name)}" aria-label="Skip ${esc(name)} today">×</button>` : ''}
@@ -917,62 +1066,76 @@
     };
   }
 
+  // A stepper field. Only the numeric measures get one — a time is typed as
+  // mm:ss, where a plus button would have to guess whether it means a second,
+  // five seconds or a minute.
+  function stepperField(id, label, value, step, mode) {
+    return `<div style="margin-bottom:0.7rem">
+      <label class="field-label" for="${id}">${label}</label>
+      <div class="stepper">
+        <button type="button" data-step="${id}" data-dir="-1">−</button>
+        <input id="${id}" type="number" inputmode="${mode}" step="${step}" value="${num(value)}">
+        <button type="button" data-step="${id}" data-dir="1">+</button>
+      </div>
+    </div>`;
+  }
+
   function logView(name) {
     const today = ymd();
+    const kind = kindOf(name);
     const { auto, coach, shown } = suggestionFor(name);
     const todaySets = state.sets.filter(s => s.date === today && s.exercise === name);
     const prev = historyFor(name).filter(s => s.date !== today).pop();
     const cfg = settingsFor(name);
 
-    const startW = todaySets.length ? todaySets[todaySets.length - 1].weight : (shown ? shown.weight : 20);
-    const startR = todaySets.length ? todaySets[todaySets.length - 1].reps : (shown ? shown.reps : 8);
+    // What each box starts at: the last set logged today, else the suggestion,
+    // else something plausible. Weight starts at zero on the kinds where it is
+    // optional — a bodyweight plank is a plank.
+    const FALLBACK = { weight: kind === 'weight' ? 20 : 0, reps: 8, distance: 20, duration: 60 };
+    const last = todaySets.length ? todaySets[todaySets.length - 1] : null;
+    const startOf = m => {
+      if (last && Number.isFinite(last[m])) return last[m];
+      if (shown && Number.isFinite(shown[m])) return shown[m];
+      return FALLBACK[m];
+    };
+    const field = m => {
+      if (m === 'weight') return stepperField('w', kind === 'weight' ? 'Weight (kg)' : 'Weight (kg) — optional', startOf('weight'), cfg.increment, 'decimal');
+      if (m === 'reps') return stepperField('r', 'Reps', startOf('reps'), 1, 'numeric');
+      if (m === 'distance') return stepperField('m', 'Distance (m)', startOf('distance'), 5, 'numeric');
+      return `<div style="margin-bottom:0.7rem">
+        <label class="field-label" for="t">Time</label>
+        <input id="t" type="text" inputmode="numeric" placeholder="mm:ss" value="${fmtDuration(startOf('duration'))}">
+        <div class="muted" style="margin-top:0.3rem">Minutes and seconds — <span class="mono">1:30</span>, or just <span class="mono">90</span>.</div>
+      </div>`;
+    };
 
     return {
       title: name,
-      sub: `${cfg.type === 'heavy' ? 'Heavy' : 'Accessory'} · ${num(cfg.increment)}kg steps`,
+      sub: kind === 'weight'
+        ? `${cfg.type === 'heavy' ? 'Heavy' : 'Accessory'} · ${num(cfg.increment)}kg steps`
+        : KINDS[kind].label,
       back: 'today',
       html: `
-        ${!isWeightExercise(name) ? `
-          <div class="card muted">
-            FitNotes tracked this one by time or distance. LiftLog only records weight × reps, so there's no
-            suggestion for it — log it here as reps if that fits, or keep it in FitNotes.
-          </div>` : ''}
-
         ${shown ? `
           <div class="suggest ${coach ? 'coach' : ''}">
-            <div class="eyebrow">${coach ? 'Coach suggests' : 'Suggested next'}</div>
-            <div class="big mono">${num(shown.weight)} kg × ${shown.reps}</div>
-            <div class="why">${esc(shown.note || '')}${coach && auto ? `<br><span class="muted">Auto-calc said ${num(auto.weight)}kg × ${auto.reps}.</span>` : ''}</div>
-            ${plateHint(shown.weight, cfg, name)}
+            <div class="eyebrow">${coach ? 'Coach suggests' : (kind === 'weight' ? 'Suggested next' : 'Last time’s best')}</div>
+            <div class="big mono">${esc(setLabel(shown, kind))}</div>
+            <div class="why">${esc(shown.note || '')}${coach && auto ? `<br><span class="muted">Auto-calc said ${esc(setLabel(auto, kind, true))}.</span>` : ''}</div>
+            ${kind === 'weight' ? plateHint(shown.weight, cfg, name) : ''}
           </div>`
-        : (isWeightExercise(name) ? '<div class="card muted">First time logging this one — put in what you do and suggestions start from your next session.</div>' : '')}
+        : '<div class="card muted">First time logging this one — put in what you do and suggestions start from your next session.</div>'}
 
         ${prev ? `
           <div class="card">
             <div class="eyebrow">Last time · ${esc(fmtDate(prev.date))}</div>
             <div class="mono" style="margin-top:0.35rem;font-size:1rem;font-weight:600">
-              ${prev.sets.map(s => `${num(s.weight)}×${s.reps}`).join('   ')}
+              ${prev.sets.map(s => esc(setLabel(s, kind, true))).join('   ')}
             </div>
           </div>` : ''}
 
         <div class="card">
-          <div style="margin-bottom:0.7rem">
-            <label class="field-label" for="w">Weight (kg)</label>
-            <div class="stepper">
-              <button type="button" data-step="w" data-dir="-1">−</button>
-              <input id="w" type="number" inputmode="decimal" step="${cfg.increment}" value="${num(startW)}">
-              <button type="button" data-step="w" data-dir="1">+</button>
-            </div>
-          </div>
-          <div style="margin-bottom:0.9rem">
-            <label class="field-label" for="r">Reps</label>
-            <div class="stepper">
-              <button type="button" data-step="r" data-dir="-1">−</button>
-              <input id="r" type="number" inputmode="numeric" step="1" value="${startR}">
-              <button type="button" data-step="r" data-dir="1">+</button>
-            </div>
-          </div>
-          <button class="btn" data-act="save-set" data-exercise="${esc(name)}">Save set</button>
+          ${KINDS[kind].measures.map(field).join('')}
+          <button class="btn" style="margin-top:0.2rem" data-act="save-set" data-exercise="${esc(name)}">Save set</button>
         </div>
 
         <div class="card">
@@ -980,12 +1143,12 @@
           ${todaySets.length ? todaySets.map((s, i) => `
             <div class="set-row">
               <div class="n">${i + 1}</div>
-              <div class="v mono">${num(s.weight)} kg × ${s.reps}</div>
+              <div class="v mono">${esc(setLabel(s, kind))}</div>
               <button class="x" data-act="del-set" data-id="${s.id}" aria-label="Delete set">×</button>
             </div>`).join('') : '<div class="muted" style="padding:0.4rem 0">No sets yet.</div>'}
         </div>
 
-        <button class="btn ghost" data-go="exsettings" data-exercise="${esc(name)}">Progression settings</button>
+        <button class="btn ghost" data-go="exsettings" data-exercise="${esc(name)}">${kind === 'weight' ? 'Progression settings' : 'Exercise settings'}</button>
       `,
     };
   }
@@ -1018,7 +1181,7 @@
                 return `<button class="list-item" data-go="log" data-exercise="${esc(n)}">
                   <div class="grow">
                     <div class="name">${esc(n)}</div>
-                    <div class="meta mono">${sug ? `Next: ${num(sug.weight)}kg × ${sug.reps}` : 'No history yet'}</div>
+                    <div class="meta mono">${esc(sug ? `Next: ${setLabel(sug, kindOf(n), true)}` : 'No history yet')}</div>
                   </div><span class="chev">›</span>
                 </button>`;
               }).join('')}
@@ -1036,9 +1199,26 @@
 
   function exSettingsView(name) {
     const cfg = settingsFor(name);
+    const kind = kindOf(name);
     return {
-      title: 'Progression', sub: name, back: 'log', backExercise: name,
+      title: kind === 'weight' ? 'Progression' : 'Exercise', sub: name, back: 'log', backExercise: name,
       html: `
+        <div class="card">
+          <label class="field-label" for="s-kind">What this exercise records</label>
+          <select id="s-kind">
+            ${Object.entries(KINDS).map(([k, v]) => `<option value="${k}" ${kind === k ? 'selected' : ''}>${v.label}</option>`).join('')}
+          </select>
+          <p class="muted" style="margin:0.7rem 0 0;line-height:1.5">
+            This decides what the log screen asks you for. Sets already logged keep the numbers they were
+            logged with, so changing it is safe.
+          </p>
+        </div>
+
+        ${kind !== 'weight' ? `
+        <div class="card muted">
+          Automatic progression is for load, so the rep ranges and increments don't apply here. On time and
+          distance work LiftLog shows your best set from last time and leaves the target to you.
+        </div>` : `
         <div class="card">
           <label class="field-label" for="s-type">Progression style</label>
           <select id="s-type">
@@ -1083,7 +1263,7 @@
               <input type="text" id="s-hi" inputmode="numeric" value="${cfg.repHigh}">
             </div>
           </div>
-        </div>
+        </div>`}
         <button class="btn" data-act="save-settings" data-exercise="${esc(name)}">Save</button>
       `,
     };
@@ -1101,11 +1281,19 @@
       html: dates.length ? `<div class="list-stack">${dates.map(d => {
         const sets = byDate.get(d);
         const exs = [...new Set(sets.map(s => s.exercise))];
-        const volume = sets.reduce((a, s) => a + s.weight * s.reps, 0);
+        // Only weight × reps has a tonnage; a day's planks and carries are
+        // summed in their own units rather than folded into a fake volume.
+        const volume = sets.reduce((a, s) => a + (Number.isFinite(s.weight) && Number.isFinite(s.reps) ? s.weight * s.reps : 0), 0);
+        const distance = sets.reduce((a, s) => a + (s.distance || 0), 0);
+        const duration = sets.reduce((a, s) => a + (s.duration || 0), 0);
+        const totals = [`${sets.length} sets`];
+        if (volume) totals.push(`${Math.round(volume).toLocaleString()} kg total volume`);
+        if (distance) totals.push(fmtDistance(distance));
+        if (duration) totals.push(`${fmtDuration(duration)} of timed work`);
         return `<div class="card">
           <div class="eyebrow">${esc(fmtDate(d))}</div>
           <div style="margin-top:0.3rem;font-weight:600">${esc(exs.join(', '))}</div>
-          <div class="muted" style="margin-top:0.2rem">${sets.length} sets · ${Math.round(volume).toLocaleString()} kg total volume</div>
+          <div class="muted" style="margin-top:0.2rem">${esc(totals.join(' · '))}</div>
         </div>`;
       }).join('')}</div>` : '<div class="empty">No history yet.</div>',
     };
@@ -1259,7 +1447,7 @@
             <div class="set-row">
               <div class="v"><div class="name">${esc(name)}</div>
                 ${s.note ? `<div class="meta muted">${esc(s.note)}</div>` : ''}</div>
-              <div class="mono" style="font-weight:650">${num(s.weight)}×${s.reps}</div>
+              <div class="mono" style="font-weight:650">${esc(setLabel(s, kindOf(name), true))}</div>
             </div>`).join('')}
           <div style="margin-top:0.7rem"><button class="btn small ghost" data-act="clear-coach">Clear these</button></div>
         </div>` : ''}
@@ -1456,9 +1644,10 @@
         if (!input) return;
         const step = parseFloat(input.step) || 1;
         const val = (parseFloat(input.value) || 0) + step * parseFloat(btn.dataset.dir);
-        // Reps can't go below one, but weight can go negative: on an assisted
-        // machine the number is how much help you're taking.
-        const floor = input.id === 'r' ? 1 : -Infinity;
+        // Reps can't go below one and a distance can't go below zero, but
+        // weight can go negative: on an assisted machine the number is how much
+        // help you're taking.
+        const floor = input.id === 'r' ? 1 : (input.id === 'm' ? 0 : -Infinity);
         input.value = num(Math.max(floor, Math.round(val * 100) / 100));
       });
     });
@@ -1558,7 +1747,11 @@
       held = null;
 
       if (changed) commitOrder(order);
-      else render();          // drop the inline transforms
+      // Redraw either way. The rows never leave their original DOM order — the
+      // whole drag is inline transforms laid over it — so clearing those
+      // without a repaint snaps the held row back to where it started, and a
+      // saved reorder stays invisible until you navigate away and come back.
+      render();
     }
 
     list.addEventListener('pointerdown', e => {
@@ -1619,8 +1812,10 @@
       case 'add-exercise': {
         if (!pl.name) return false;
         state.exercises[pl.name] = {
+          // An unrecognised kind is left unclassified rather than forced to
+          // weight × reps — the app can work it out from the name.
           category: pl.category || 'Uncategorized',
-          kind: 'weight',
+          kind: KINDS[pl.kind] ? pl.kind : 'weight',
           ...(pl.equipment ? { equipment: pl.equipment } : {}),
         };
         return true;
@@ -1663,18 +1858,35 @@
   function act(what, data) {
     switch (what) {
       case 'save-set': {
-        const w = parseFloat(document.getElementById('w').value);
-        const r = parseInt(document.getElementById('r').value, 10);
-        if (!Number.isFinite(w) || !Number.isFinite(r) || r <= 0) { toast('Enter a weight and reps.'); return; }
+        const kind = kindOf(data.exercise);
+        const val = id => { const el = document.getElementById(id); return el ? el.value : ''; };
+        const read = {
+          weight: () => parseFloat(val('w')),
+          reps: () => parseInt(val('r'), 10),
+          distance: () => parseFloat(val('m')),
+          duration: () => parseDuration(val('t')),
+        };
+        const set = { id: uid(), date: ymd(), exercise: data.exercise, notes: '', src: 'app' };
+        for (const m of KINDS[kind].measures) {
+          const v = read[m]();
+          if (Number.isFinite(v)) set[m] = m === 'reps' ? v : Math.round(v * 100) / 100;
+        }
+        // Weight on its own is not a set: a hold needs a time, a carry needs a
+        // distance, and weight × reps needs both. Weight itself may be zero
+        // (bodyweight) or negative (assisted), so it is never the test.
+        const ok = kind === 'weight'
+          ? Number.isFinite(set.weight) && set.reps > 0
+          : KINDS[kind].measures.some(m => m !== 'weight' && set[m] > 0);
+        if (!ok) { toast(kind === 'weight' ? 'Enter a weight and reps.' : 'Enter a time or a distance.'); return; }
         // The session clock starts at the first set, not when the workout was
         // picked — you often set up for a few minutes before lifting.
         const session = activeSession();
         if (session && !session.startedAt) session.startedAt = new Date().toISOString();
-        state.sets.push({
-          id: uid(), date: ymd(), exercise: data.exercise, weight: w, reps: r,
-          notes: '', src: 'app', ...(session ? { sessionId: session.id } : {}),
-        });
-        if (!state.exercises[data.exercise]) state.exercises[data.exercise] = { category: 'Uncategorized' };
+        if (session) set.sessionId = session.id;
+        state.sets.push(set);
+        // Remember the kind against the exercise, so one logged set settles
+        // what it is rather than the name heuristic guessing again next time.
+        if (!state.exercises[data.exercise]) state.exercises[data.exercise] = { category: 'Uncategorized', kind };
         save(); render(); toast('Set saved.');
         return;
       }
@@ -1803,21 +2015,28 @@
         return;
       }
       case 'save-settings': {
-        const type = document.getElementById('s-type').value;
-        const equipment = document.getElementById('s-equip').value;
-        const inc = parseFloat(document.getElementById('s-inc').value);
-        const cad = parseInt(document.getElementById('s-cad').value, 10);
-        const lo = parseInt(document.getElementById('s-lo').value, 10);
-        const hi = parseInt(document.getElementById('s-hi').value, 10);
-        const fallback = equipment === 'barbell' ? smallestPlate() * 2 : (state.prefs.increment || 1.25);
-        state.settings[data.exercise] = {
-          type,
-          equipment,
-          increment: Number.isFinite(inc) && inc > 0 ? inc : fallback,
-          cadenceWeeks: Number.isFinite(cad) && cad > 0 ? cad : 1,
-          repLow: Number.isFinite(lo) && lo > 0 ? lo : 8,
-          repHigh: Number.isFinite(hi) && hi > 0 ? hi : 12,
-        };
+        const kind = document.getElementById('s-kind').value;
+        const meta = state.exercises[data.exercise] || (state.exercises[data.exercise] = { category: 'Uncategorized' });
+        if (KINDS[kind]) meta.kind = kind;
+        // The progression fields are only on screen for weight × reps work —
+        // saving from any other kind must leave whatever they hold alone.
+        const type = document.getElementById('s-type');
+        if (type) {
+          const equipment = document.getElementById('s-equip').value;
+          const inc = parseFloat(document.getElementById('s-inc').value);
+          const cad = parseInt(document.getElementById('s-cad').value, 10);
+          const lo = parseInt(document.getElementById('s-lo').value, 10);
+          const hi = parseInt(document.getElementById('s-hi').value, 10);
+          const fallback = equipment === 'barbell' ? smallestPlate() * 2 : (state.prefs.increment || 1.25);
+          state.settings[data.exercise] = {
+            type: type.value,
+            equipment,
+            increment: Number.isFinite(inc) && inc > 0 ? inc : fallback,
+            cadenceWeeks: Number.isFinite(cad) && cad > 0 ? cad : 1,
+            repLow: Number.isFinite(lo) && lo > 0 ? lo : 8,
+            repHigh: Number.isFinite(hi) && hi > 0 ? hi : 12,
+          };
+        }
         save(); go('log', { exercise: data.exercise }); toast('Saved.');
         return;
       }
@@ -1845,7 +2064,12 @@
           if (!sets.length && !Object.keys(exercises).length) { toast('No rows recognised in that file.'); return; }
           state.sets = [...state.sets.filter(s => s.src !== 'fitnotes'), ...sets];
           for (const [name, meta] of Object.entries(exercises)) {
-            if (!state.exercises[name] || categoryOf(name) === 'Uncategorized') state.exercises[name] = meta;
+            const cur = state.exercises[name];
+            if (!cur) { state.exercises[name] = meta; continue; }
+            // Fill in the blanks rather than overwriting: an equipment override
+            // set by hand shouldn't be lost to a re-import.
+            if (meta.category && cur.category === 'Uncategorized') cur.category = meta.category;
+            if (meta.kind && !KINDS[cur.kind]) cur.kind = meta.kind;
           }
           // A bulk swap is a wholesale replace, so it must win the next sync
           // rather than be merged set-by-set against the server's copy.
