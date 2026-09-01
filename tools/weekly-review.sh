@@ -23,18 +23,22 @@ Work against the repo ${REPO}, using ${HERE}/coach-io.py as always.
 
 1. Read the current state. Pay particular attention to the check-ins and to any
    questions of yours that have since been answered.
-2. Decide whether there is anything to say. If no sets have been logged since
-   your last brief, write nothing at all.
+2. Decide whether there is anything to say. Nothing logged AND nothing answered
+   since your last brief means write no new brief at all.
 3. Otherwise write the coach block: the brief, any per-exercise calls, any
    proposals, and at most two or three questions — carrying forward the ones
    still unanswered and dropping the ones now answered.
+4. Refill the staged bank either way — this part is not optional and happens
+   even on a silent week. Answered entries are spent, and an empty bank leaves
+   the app with only its own generic card until you next run. Keep three to six
+   staged, most of them carrying a `when` rule.
 
 Write the coach JSON with python3 (a heredoc is not available to you here):
 python3 -c "import json,pathlib; pathlib.Path('/tmp/coach.json').write_text(json.dumps({...}))"
 
 Then end your reply with a single line, on its own, of at most 110 characters:
 
-NOTIFY: <the one thing worth knowing, or the word 'skip' if you wrote nothing>
+NOTIFY: <the one thing worth knowing, or the word 'skip' if you wrote no brief>
 
 Make that line specific — "bench has stalled 6 weeks, 2 questions for you"
 tells me whether to open the app; "review complete" does not.
